@@ -25127,11 +25127,32 @@ function ytFilters(ext) {
   var GU_BUILD = "23050";
   var GU_SIG = "32E0AB4FF93A29CE0E6F0BFB01F2F1B788E76262731F3F30F509CB822428ED58";
   var GU_DEVBUILD = "pangu-build-component-system-513739-s9vkd-rlxnj-p3rhm";
-  var GU_MARK = ["最新版下载地址", "最新版本下载地址", "版本已经失效", "请下载最新版", "__v99_"];
+  var GU_MARK = ["最新版下载地址", "最新版本下载地址", "版本已经失效", "请下载最新版", "__v99_", "glgl.tv", "111.170.58.215", "shu.jpg"];
   var GU_CATS = [
     { id: "1", name: "电影" }, { id: "2", name: "电视剧" }, { id: "3", name: "综艺" },
     { id: "4", name: "动漫" }, { id: "5", name: "短剧" }, { id: "60", name: "直播" }
   ];
+  var GU_FILTERS = (function () {
+    var genres = ["动作", "喜剧", "爱情", "科幻", "恐怖", "剧情", "战争", "犯罪", "悬疑", "动画", "冒险", "奇幻", "惊悚", "家庭"];
+    var areas = ["大陆", "香港", "台湾", "美国", "日本", "韩国", "英国", "法国", "泰国", "印度"];
+    var sorts = [["月热门", "vod_hits_month"], ["周热门", "vod_hits_week"], ["日热门", "vod_hits_day"], ["最新", "vod_time"], ["评分", "vod_score"]];
+    function row(key, pairs) {
+      return { key: key, name: key, value: [{ n: "全部", v: "" }].concat(pairs.map(function (p) {
+        return { n: p[0], v: p[1] };
+      })) };
+    }
+    var out = {}, i;
+    for (i = 0; i < GU_CATS.length; i++) {
+      var id = GU_CATS[i].id;
+      if (id === "60") continue;
+      out[id] = [
+        row("类型", genres.map(function (g) { return [g, g]; })),
+        row("地区", areas.map(function (a) { return [a, a]; })),
+        row("排序", sorts)
+      ];
+    }
+    return out;
+  })();
   var GU_ORDER = ["咕噜4K", "新咕噜4K", "菲乐4K", "鲸宝4K", "极速蓝光", "VIP4K", "VIP蓝光", "神话", "臻影4K", "臻影",
     "精品2K", "鲸宝2K", "短剧2K", "菲乐2K", "iyf4k", "天堂",
     "☆讯飞☆", "☆奇趣☆", "☆果汁☆", "☆酷萌☆", "☆哔哩☆", "☆哔狸☆",
@@ -25388,9 +25409,11 @@ function ytFilters(ext) {
     return false;
   }
 
-  async function searchRaw(kw, page, limit, cat) {
-    var f = Buffer.concat([fb(18, "vod_hits_month"), fv(19, 1)]);
+  async function searchRaw(kw, page, limit, cat, genre, area, sort) {
+    var f = Buffer.concat([fb(18, sort || "vod_hits_month"), fv(19, 1)]);
     if (cat) f = Buffer.concat([f, fb(3, cat), fb(4, cat)]);
+    if (genre) f = Buffer.concat([f, fb(8, genre)]);
+    if (area) f = Buffer.concat([f, fb(6, area)]);
     var payload = Buffer.concat([fb(1, kw || ""), fv(2, page || 1), fv(3, limit || 21), fb(5, f)]);
     var resp = await rpc(61, payload, 3);
     var data = val(resp, 4, Buffer.alloc(0), 2);
@@ -25426,7 +25449,7 @@ function ytFilters(ext) {
     var resp = await rpc(62, payload, 3, { "x-player-page-protection": "1" });
     var data = val(resp, 4, Buffer.alloc(0), 2);
     var name = txt(val(data, 5, Buffer.alloc(0), 2));
-    var guard = [txt(val(data, 5, Buffer.alloc(0), 2)), txt(val(data, 21, Buffer.alloc(0), 2))];
+    var guard = [txt(val(data, 5, Buffer.alloc(0), 2)), txt(val(data, 13, Buffer.alloc(0), 2)), txt(val(data, 21, Buffer.alloc(0), 2))];
     var srcAll = vals(data, 75, 2), i, j;
     for (i = 0; i < srcAll.length; i++) guard.push(txt(val(srcAll[i], 1, Buffer.alloc(0), 2)));
     if (poisoned(guard)) return { guard: true };
@@ -25469,11 +25492,25 @@ function ytFilters(ext) {
     };
   }
 
+  /* 服务器可能返回「原画,https://...」组合串，取其中真正的播放地址 */
+  function pickPlayable(v) {
+    var s = String(v == null ? "" : v).replace(/^\s+|\s+$/g, "");
+    if (!s) return "";
+    if (/^https?:\/\//i.test(s)) return s;
+    var parts = s.split(/[,，]/), i;
+    for (i = 0; i < parts.length; i++) {
+      var p = parts[i].replace(/^\s+|\s+$/g, "");
+      if (/^https?:\/\//i.test(p)) return p;
+    }
+    var m = /(https?:\/\/[^\s,，]+)/i.exec(s);
+    return m ? m[1] : "";
+  }
+
   async function playRaw(pid, ep) {
     var payload = Buffer.concat([fv(1, Number(pid) || 0), fb(2, String(ep || ""))]);
     var resp = await rpc(69, payload, 3);
     var data = val(resp, 4, Buffer.alloc(0), 2);
-    return txt(val(data, 2, Buffer.alloc(0), 2));
+    return pickPlayable(txt(val(data, 2, Buffer.alloc(0), 2)));
   }
 
   function serial(fn) {
@@ -25525,21 +25562,21 @@ function ytFilters(ext) {
     return st.ready;
   }
 
-  async function search(kw, page, limit, cat) {
+  async function search(kw, page, limit, cat, genre, area, sort) {
     var r;
     await ensure();
     try {
-      r = await searchRaw(kw, page, limit, cat);
+      r = await searchRaw(kw, page, limit, cat, genre, area, sort);
       if (r.list.length && poisoned(r.list.slice(0, 3).map(function (x) { return x.vod_name; }))) {
         st.ready = null;
         await ensure();
-        r = await searchRaw(kw, page, limit, cat);
+        r = await searchRaw(kw, page, limit, cat, genre, area, sort);
       }
     } catch (e) {
       st.ready = null;
       reset(st.ver);
       await ensure();
-      r = await searchRaw(kw, page, limit, cat);
+      r = await searchRaw(kw, page, limit, cat, genre, area, sort);
     }
     return r;
   }
@@ -25651,14 +25688,19 @@ function ytFilters(ext) {
         var r = await search("", 1, 20, "");
         return {
           "class": GU_CATS.map(function (c) { return { type_id: c.id, type_name: c.name }; }),
-          filters: {},
+          filters: GU_FILTERS,
           list: r.list.slice(0, 20)
         };
       });
       e.post("/category", async function (req) {
         var b = body(req);
         var page = Number(b.page || 1) || 1;
-        var r = await search("", page, 21, String(b.id || b.type_id || ""));
+        var ext = b.extend || b.filters || {};
+        if (typeof ext === "string") { try { ext = JSON.parse(ext); } catch (e) { ext = {}; } }
+        var genre = String(ext["类型"] || ext.genre || "").replace(/^\s+|\s+$/g, "");
+        var area = String(ext["地区"] || ext.area || "").replace(/^\s+|\s+$/g, "");
+        var sort = String(ext["排序"] || ext.sort || "").replace(/^\s+|\s+$/g, "");
+        var r = await search("", page, 21, String(b.id || b.type_id || ""), genre, area, sort);
         return { page: Number(r.page || page), pagecount: Number(r.pagecount || 1), limit: 21, total: Number(r.total || r.list.length), list: r.list };
       });
       e.post("/search", async function (req) {
@@ -25717,8 +25759,11 @@ function ytFilters(ext) {
             }
           }
         }
+        u = pickPlayable(u);
         if (!u) return playObj("", { ua: uaOf(req), error: "解析失败，请尝试更换播放源" });
-        return playObj(fixUrl(u), { ua: uaOf(req), header: { "User-Agent": GU_UA } });
+        var hdr = { "User-Agent": GU_UA };
+        if (!/picovr\.com|ppvod|drive\.quark\.cn/i.test(u)) hdr["Referer"] = "http://" + GU_HOST + "/";
+        return playObj(fixUrl(u), { ua: uaOf(req), header: hdr });
       };
       e.post("/play", play);
       e.get("/play", play);
