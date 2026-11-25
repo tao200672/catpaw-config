@@ -6,7 +6,7 @@ var __EXT_URLS = [
   "https://ghproxy.net/https://raw.githubusercontent.com/tao200672/catpaw-config/main/local-sources.js.gz"
 ];
 var __EXT_URL = __EXT_URLS[0];
-var __EXT_SHA256 = "09f096288bdcc95477c8e16a11fbf591bc3ac16c73c23d0cd276adbb17801fa4";
+var __EXT_SHA256 = "038788f098aab67adf351dff61b5da3f7d55a58af3caf2443d17aa11e766e08e";
 var __extSites = null, __extPromise = null;
 function __extGet(url, depth, cb, tmo) {
   try {
