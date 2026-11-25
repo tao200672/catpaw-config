@@ -3,7 +3,7 @@ var __EXT_URLS = [
   "https://gitee.com/kishuto/catpaw-config/raw/master/local-sources.js.gz"
 ];
 var __EXT_URL = __EXT_URLS[0];
-var __EXT_SHA256 = "f3a962a096d841b00e446de94bf8899690f78706c76df863ffb59223e37d0103";
+var __EXT_SHA256 = "f086b5db81c45dfc0fd3fe0b9e72d6c06a75a41e37892d894e126c96bbe790a8";
 var __extSites = null, __extPromise = null;
 function __extGet(url, depth, cb, tmo) {
   try {
