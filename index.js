@@ -1,12 +1,9 @@
 
 var __EXT_URLS = [
-  "https://ghfast.top/https://raw.githubusercontent.com/tao200672/catpaw-config/main/local-sources.js.gz",
-  "https://cdn.jsdelivr.net/gh/tao200672/catpaw-config@main/local-sources.js.gz",
-  "https://raw.githubusercontent.com/tao200672/catpaw-config/main/local-sources.js.gz",
-  "https://ghproxy.net/https://raw.githubusercontent.com/tao200672/catpaw-config/main/local-sources.js.gz"
+  "https://gitee.com/kishuto/catpaw-config/raw/master/local-sources.js.gz"
 ];
 var __EXT_URL = __EXT_URLS[0];
-var __EXT_SHA256 = "0bcd383382f28fb132c183cc61210e515a309a080cce0a6b25876d95bd878414";
+var __EXT_SHA256 = "f16ad7fc0ea15c299a3befcbea75d6da1f2acc1664f8ba9435c0fc025ec4220a";
 var __extSites = null, __extPromise = null;
 function __extGet(url, depth, cb, tmo) {
   try {
