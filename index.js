@@ -1,7 +1,7 @@
 
-var __EXT_URLS = ["https://gitee.com/kishuto/catpaw-config/raw/master/local-sources.js.gz"];
+var __EXT_URLS = ["https://cdn.jsdelivr.net/gh/tao200672/catpaw-config@main/local-sources.e97502ce.js.gz", "https://raw.githubusercontent.com/tao200672/catpaw-config/main/local-sources.e97502ce.js.gz", "https://gitee.com/kishuto/catpaw-config/raw/master/local-sources.e97502ce.js.gz"];
 var __EXT_URL = __EXT_URLS[0];
-var __EXT_SHA256 = "563ff7f0331adca2c4c311d8ef6bdb916a55115d65a3e28d94833fef1848ad5b";
+var __EXT_SHA256 = "e97502ce72ec4a469d32a82aef1edee8e7727163c07637923ae040e2f8be33fd";
 var __extSites = null, __extPromise = null;
 function __extGet(url, depth, cb, tmo) {
   try {
@@ -20,7 +20,7 @@ function __extGet(url, depth, cb, tmo) {
       res.on("error", cb);
     });
     req.on("error", cb);
-    req.setTimeout(tmo || 15000, function () { req.destroy(new Error("timeout")); });
+    req.setTimeout(tmo || 45000, function () { req.destroy(new Error("timeout")); });
     return req;
   } catch (e) { cb(e); }
 }
@@ -52,7 +52,7 @@ function __extLoad() {
           console.log("[ext] loaded from source " + i);
           finish(m.exports);
         } catch (e) { oneFail("source " + i + " decode failed: " + (e && e.message)); }
-      }, 15000);
+      }, 45000);
       reqs[i] = r;
     });
   });
