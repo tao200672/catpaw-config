@@ -22445,10 +22445,12 @@ ${X.map(te=>te.name).join(`
  * 猫源站点：🎬 影探4K（cms.lyyytv.cn）
  * ----------------------------------------------------------------------------
  * 依赖 extra_sites.js 作用域里已有的：get / js / body / playObj / pickEp / uaOf
- * 解析集群（热备）：
- *   4kzj.lyyytv.cn  parsesId 1=网页 2=4K直链   ← 内置新解析，优先
- *   fys.lyyytv.cn   parsesId 5=网页 6=4K直链   ← 旧口，兜底
- * 两套口互不通用：同一个 parsesId 换域名会返回 System Error。
+ * 解析集群（2026-11-26 全量实测）：
+ *   4kzj.lyyytv.cn  parsesId 3=网页 5=4K直链
+ *   fys.lyyytv.cn   parsesId 7=网页 8=4K直链
+ * 两套域名绑的是各自独立的 pid 映射，交叉使用一律失败（fys 上 pid3 直接 500），
+ * 所以必须成对配置、按域名级联。旧值 1/2/6 现在全部返回“解析失败”。
+ * 服务商隔段时间就改 pid，单口随时会挂，两个域名互为备援。
  * ========================================================================== */
 var YT = {
   host: "http://cms.lyyytv.cn",
@@ -22456,8 +22458,8 @@ var YT = {
   ua: "okhttp/4.12.0",
   page: 20,
   hosts: [
-    { name: "4kzj", api: "http://4kzj.lyyytv.cn/api/index?appid=10001&videoUrl=", web: 1, four: 2 },
-    { name: "fys", api: "http://fys.lyyytv.cn/api/index?appid=10001&videoUrl=", web: 5, four: 6 }
+    { name: "4kzj", api: "http://4kzj.lyyytv.cn/api/index?appid=10001&videoUrl=", web: 3, four: 5 },
+    { name: "fys", api: "http://fys.lyyytv.cn/api/index?appid=10001&videoUrl=", web: 7, four: 8 }
   ],
   filters: [
     ["class", "类型"], ["area", "地区"], ["lang", "语言"], ["year", "年份"],
@@ -22522,6 +22524,21 @@ function ytResolve(body) {
 }
 
 /* kind: "web"（腾讯/爱奇艺等页面）| "4k"（ym4kjx 裸直链） */
+function ytHostOf(u) {
+  var m = /^https?:\/\/([^\/?#]+)/i.exec(ytText(u));
+  return m ? m[1].toLowerCase().replace(/:\d+$/, "") : "";
+}
+
+/* 解析口有时候把 4K 裸链原样吐回来（说明它换链失败，源文件多半已删）。
+ * 这种链接丢给播放器只会 404 黑屏，所以取 1 字节确认文件还在。 */
+async function ytAlive(u) {
+  try {
+    var r = await get(u, { "User-Agent": YT.ua, Range: "bytes=0-0" }, 8000);
+    var st = Number((r && r.status) || 0);
+    return st === 200 || st === 206;
+  } catch (e) { return false; }
+}
+
 async function ytParse(raw, kind) {
   for (var i = 0; i < YT.hosts.length; i++) {
     var h = YT.hosts[i];
@@ -22530,7 +22547,7 @@ async function ytParse(raw, kind) {
     for (var rnd = 0; rnd < 2; rnd++) {
       if (rnd) await ytSleep(400 * rnd);
       try {
-        var res = await get(target, { "User-Agent": YT.ua }, 25000);
+        var res = await get(target, { "User-Agent": YT.ua }, 12000);
         var out = ytResolve(res && res.body);
         if (out) return out;
       } catch (e) { /* 换下一个口 */ }
@@ -22942,7 +22959,13 @@ function ytFilters(ext) {
         var out = "";
         if (YT_FOUR_RE.test(host)) {
           out = await ytParse(raw, "4k");
-          if (!out) return playObj("", { ua: ua, error: "影探4K：4K 换链失败（解析接口不可用或已失效）" });
+          /* 换链回来还是 lyyytv 裸链 = 解析口没换成，多半文件已删。
+           * 先探一字节，404 就换网页口再试一次，别把死链丢给播放器。 */
+          if (out && /\.lyyytv\.cn\//i.test(out) && !(await ytAlive(out))) {
+            var alt = await ytParse(raw, "web");
+            out = (alt && !/\.lyyytv\.cn\//i.test(alt)) ? alt : "";
+          }
+          if (!out) return playObj("", { ua: ua, error: "影探4K：该线路源文件已失效（4K 直链 404），换一条线路试试" });
         } else if (YT_MEDIA_RE.test(path)) {
           out = raw;
         } else {
