@@ -1,7 +1,7 @@
 
-var __EXT_URLS = ["https://cdn.jsdelivr.net/gh/tao200672/catpaw-config@main/local-sources.248dfbb6.js.gz", "https://raw.githubusercontent.com/tao200672/catpaw-config/main/local-sources.248dfbb6.js.gz", "https://gitee.com/kishuto/catpaw-config/raw/master/local-sources.248dfbb6.js.gz"];
+var __EXT_URLS = ["https://cdn.jsdelivr.net/gh/tao200672/catpaw-config@main/local-sources.d2d21687.js.gz", "https://raw.githubusercontent.com/tao200672/catpaw-config/main/local-sources.d2d21687.js.gz", "https://gitee.com/kishuto/catpaw-config/raw/master/local-sources.d2d21687.js.gz"];
 var __EXT_URL = __EXT_URLS[0];
-var __EXT_SHA256 = "248dfbb69e91d68912a3d4310739d6375ac542e9002f9cfa8ccf4b491d9c5db0";
+var __EXT_SHA256 = "d2d21687218d2af45208f63130b9a66cca29d7d0e0062e00cf94161eb62391ca";
 var __extSites = null, __extPromise = null;
 function __extGet(url, depth, cb, tmo) {
   try {
