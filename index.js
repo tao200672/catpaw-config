@@ -1,5 +1,10 @@
 
-var __EXT_URLS = ["https://gitee.com/kishuto/catpaw-config/raw/master/local-sources.js.gz"];
+var __EXT_URLS = [
+  "https://gh-proxy.com/https://raw.githubusercontent.com/tao200672/catpaw-config/main/local-sources.js.gz",
+  "https://ghfast.top/https://raw.githubusercontent.com/tao200672/catpaw-config/main/local-sources.js.gz",
+  "https://cdn.jsdelivr.net/gh/tao200672/catpaw-config@main/local-sources.js.gz",
+  "https://gitee.com/kishuto/catpaw-config/raw/master/local-sources.js.gz"
+];
 var __EXT_URL = __EXT_URLS[0];
 var __EXT_SHA256 = "d29fb3e4f46e8adf4720ef73575978894a0443c52a13c5b7641e207de4867729";
 var __extSites = null, __extPromise = null;
@@ -39,21 +44,26 @@ function __extLoad() {
       if (--left <= 0) { console.log("[ext] all sources failed"); finish(null); }
     }
     __EXT_URLS.forEach(function (url, i) {
-      var r = __extGet(url, 0, function (err, buf) {
+      /* 阶梯启动：主源先跑，600ms 没结果再放下一源，避免弱网下四路互抢带宽 */
+      var tm = setTimeout(function () {
         if (settled) return;
-        if (err) return oneFail("source " + i + " failed: " + err.message);
-        try {
-          var h = require("node:crypto").createHash("sha256").update(buf).digest("hex");
-          if (h !== __EXT_SHA256) throw new Error("hash mismatch");
-          var code = require("node:zlib").gunzipSync(buf).toString("utf8");
-          var m = { exports: {} };
-          new Function("module", "exports", "require", "__dirname", "__filename", code)(m, m.exports, require, __dirname, __filename);
-          if (!m.exports || !m.exports.__sites) throw new Error("bad export");
-          console.log("[ext] loaded from source " + i);
-          finish(m.exports);
-        } catch (e) { oneFail("source " + i + " decode failed: " + (e && e.message)); }
-      }, 15000);
-      reqs[i] = r;
+        var r = __extGet(url, 0, function (err, buf) {
+          if (settled) return;
+          if (err) return oneFail("source " + i + " failed: " + err.message);
+          try {
+            var h = require("node:crypto").createHash("sha256").update(buf).digest("hex");
+            if (h !== __EXT_SHA256) throw new Error("hash mismatch");
+            var code = require("node:zlib").gunzipSync(buf).toString("utf8");
+            var m = { exports: {} };
+            new Function("module", "exports", "require", "__dirname", "__filename", code)(m, m.exports, require, __dirname, __filename);
+            if (!m.exports || !m.exports.__sites) throw new Error("bad export");
+            console.log("[ext] loaded from source " + i);
+            finish(m.exports);
+          } catch (e) { oneFail("source " + i + " decode failed: " + (e && e.message)); }
+        }, 20000);
+        reqs[i] = r;
+      }, i * 600);
+      tm.unref && tm.unref();
     });
   });
   return __extPromise;
