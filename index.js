@@ -22054,7 +22054,12 @@ ${X.map(te=>te.name).join(`
        · 取链结果按集缓存 8 分钟（签名在 expires_at 前一直有效），403 时自动重新签发
      HLS（.m3u8）线路不套代理，直接交给播放器。 */
   var XF_CDN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-  var XF_RL_W = 16, XF_RL_CHUNK = 131072, XF_RL_HEAD = 262144, XF_RL_HW = 8, XF_RL_CACHE = 16 << 20;
+  /* 实测（移动云盘终链）：单请求延迟 0.3-1s，吞吐≈分块大小/RTT。
+     64KB 分块 16 路仅 2MB/s；1MB 分块 16 路到 5.9MB/s。故取 1MB。 */
+  /* 实测该 CDN：单请求延迟恒定≈650ms（与并发无关），吞吐随并发线性增长。
+     故首块只抓 64KB 立刻下发（起播不等全部就绪），moov 剩下的部分交给
+     16 路 x 1MB 窗口并行补齐（16x1MB 实测 2.2-4.9MB/s）。 */
+  var XF_RL_W = 16, XF_RL_CHUNK = 262144, XF_RL_HEAD = 65536, XF_RL_HW = 1, XF_RL_CACHE = 32 << 20;
   var XF_ITEMS = {}, XF_SEQ = 0, XF_PLAY_CACHE = {};
 
   async function xfIssue(ep, force) {
@@ -22069,14 +22074,26 @@ ${X.map(te=>te.name).join(`
       var cs = j.candidates || [];
       for (var i = 0; i < cs.length; i++) if (cs[i] && cs[i].url === u) { size = Number(cs[i].expected_bytes || 0) || 0; break; }
     } catch (e0) { }
-    var rec = { url: u, size: size, exp: Number(j.expires_at || 0) || 0, at: now };
+    var alts = [];
+    try {
+      var cs0 = j.candidates || [];
+      for (var ci = 0; ci < cs0.length; ci++) {
+        var cu = cs0[ci] && cs0[ci].url;
+        if (!cu || cu === u) continue;
+        /* 只要 MP4 候选；m3u8 没有字节区间语义，不能走 Range 代理 */
+        if (/\.m3u8(\?|#|$)/i.test(String(cu))) continue;
+        alts.push(String(cu));
+      }
+    } catch (e2) { }
+    var rec = { url: u, size: size, exp: Number(j.expires_at || 0) || 0, at: now, alts: alts };
     XF_PLAY_CACHE[key] = rec;
     var ks = Object.keys(XF_PLAY_CACHE);
     if (ks.length > 200) ks.slice(0, 60).forEach(function (k) { delete XF_PLAY_CACHE[k]; });
     return rec;
   }
 
-  function xfHttpGet(u, headers, timeout) {
+  function xfHttpGet(u, headers, timeout, depth) {
+    depth = depth || 0;
     return new Promise(function (resolve, reject) {
       var p;
       try { p = new URL(u); } catch (e) { return reject(e); }
@@ -22084,11 +22101,66 @@ ${X.map(te=>te.name).join(`
       var r = lib.request({
         protocol: p.protocol, hostname: p.hostname, port: p.port || (p.protocol === "http:" ? 80 : 443),
         path: p.pathname + p.search, method: "GET", headers: headers || {}, timeout: timeout || 30000
-      }, function (res) { resolve(res); });
+      }, function (res) {
+        /* 稀饭主链会 302 跳 CDN（apn.moedot.net 等）：不跟随就永远拿不到 206 */
+        var code = res.statusCode || 0;
+        if (code === 301 || code === 302 || code === 303 || code === 307 || code === 308) {
+          var loc = res.headers && res.headers.location;
+          try { res.resume(); } catch (e0) { }
+          if (loc && depth < 5) {
+            var next;
+            try { next = new URL(loc, u).toString(); } catch (e1) { return reject(e1); }
+            return resolve(xfHttpGet(next, headers, timeout, depth + 1));
+          }
+          return reject(new Error("redirect " + code + " no location"));
+        }
+        res.__url = u;
+        resolve(res);
+      });
       r.on("error", reject);
       r.on("timeout", function () { r.destroy(new Error("timeout")); });
       r.end();
     });
+  }
+
+  /* 解析 302 一次并缓存最终直链：否则每个分块都要多花 200-600ms 走一次跳转 */
+  function xfResolve(it) {
+    if (it.final) return Promise.resolve(it.final);
+    if (it.resolving) return it.resolving;
+    it.resolving = xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=0-1", "Accept-Encoding": "identity" }), 12000).then(function (res) {
+      var m = /\/(\d+)\s*$/.exec(String(res.headers["content-range"] || ""));
+      if (m) it.size = Number(m[1]) || it.size;
+      if (res.__url) { it.final = res.__url; it.url = res.__url; }
+      try { res.destroy(); } catch (e0) { }
+      it.resolving = null;
+      return it.final || it.url;
+    }).catch(function () {
+      it.resolving = null;
+      return it.url;
+    });
+    return it.resolving;
+  }
+
+  /* 兜底：单连接直连顺序下推（多路被 CDN 拒时仍能播，不会干等） */
+  function xfPipeDirect(it, res, start, end) {
+    return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=" + start + "-" + end, "Accept-Encoding": "identity" }), 30000).then(function (r) {
+      var skip = (r.statusCode === 200 && start > 0) ? start : 0;
+      var pos = start;
+      r.on("data", function (c) {
+        var buf = c;
+        if (skip > 0) {
+          if (c.length <= skip) { skip -= c.length; return; }
+          buf = c.slice(skip); skip = 0;
+        }
+        if (pos + buf.length > end + 1) buf = buf.slice(0, end + 1 - pos);
+        if (!buf.length) return;
+        pos += buf.length;
+        try { res.write(buf); } catch (e0) { }
+        if (pos > end) { try { r.destroy(); } catch (e1) { } try { res.end(); } catch (e2) { } }
+      });
+      r.on("end", function () { try { res.end(); } catch (e) { } });
+      r.on("error", function () { try { res.end(); } catch (e) { } });
+    }).catch(function () { try { res.end(); } catch (e) { } });
   }
 
   function xfRange(it, s, e, tries) {
@@ -22108,6 +22180,7 @@ ${X.map(te=>te.name).join(`
             }
             return attempt(n + 1);
           }
+          if (res.__url && res.__url !== it.url) it.url = res.__url;
           return new Promise(function (resolve) {
             var buf = [], got = 0, done = false;
             function fin(b) { if (!done) { done = true; resolve(b); } }
@@ -22127,6 +22200,7 @@ ${X.map(te=>te.name).join(`
   function xfSize(it) {
     if (it.size) return Promise.resolve(it.size);
     return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=0-0" }), 15000).then(function (res) {
+      if (res.__url && res.__url !== it.url) it.url = res.__url;
       var m = /\/(\d+)\s*$/.exec(String(res.headers["content-range"] || ""));
       try { res.resume(); } catch (x) { }
       if (m) it.size = Number(m[1]);
@@ -22149,6 +22223,8 @@ ${X.map(te=>te.name).join(`
   function xfStream(req, res, it) {
     var closed = false;
     res.on("close", function () { closed = true; });
+    /* resolve 与首块并发跑：首块自己也会跟随 302，不必串行等它 */
+    try { xfResolve(it); } catch (e_r) { }
     xfSize(it).then(function (total) {
       if (!total || total <= 0) { res.statusCode = 502; return res.end(); }
       var hdr = (req.headers && req.headers.range) || "";
@@ -22223,21 +22299,38 @@ ${X.map(te=>te.name).join(`
         while (nextPos <= end && order.length < XF_RL_W) { order.push(nextPos); nextPos = submit(nextPos); }
         pump();
       }
-      for (var hi = 0; hi < sliceN; hi++) {
-        (function (idx) {
-          var s0 = start + idx * hs, e0 = Math.min(s0 + hs - 1, start + headWant - 1);
-          xfRange(it, s0, e0, 2).then(function (b) {
-            slices[idx] = b || Buffer.alloc(0);
-          }).catch(function () {
-            slices[idx] = Buffer.alloc(0);
-          }).then(function () {
-            flushHead();
-            doneN++;
-            if (closed) return;
-            if (doneN >= sliceN) startWindow();
-          });
-        })(hi);
+      var altTried = false;
+      function headRound() {
+        for (var hi = 0; hi < sliceN; hi++) {
+          (function (idx) {
+            var s0 = start + idx * hs, e0 = Math.min(s0 + hs - 1, start + headWant - 1);
+            xfRange(it, s0, e0, 2).then(function (b) {
+              slices[idx] = b || Buffer.alloc(0);
+            }).catch(function () {
+              slices[idx] = Buffer.alloc(0);
+            }).then(function () {
+              flushHead();
+              doneN++;
+              if (slices[idx] === null || (slices[idx] && slices[idx].length)) got++;
+              if (doneN < sliceN || closed) return;
+              if (wi > 0) return startWindow();
+              /* 首块一个字都没拿到：换备用 CDN 再试一轮，仍不行就断开，别让播放器干等 */
+              var alts = (it.alts || []).filter(function (u) { return u && u !== it.url; });
+              if (!altTried && alts.length) {
+                altTried = true;
+                it.url = alts[0];
+                it.final = "";
+                it.alts = alts.slice(1);
+                slices = new Array(sliceN); wi = 0; doneN = 0;
+                return headRound();
+              }
+              /* 多路彻底不可用：退回单连接直推，至少能播 */
+              xfPipeDirect(it, res, start, end);
+            });
+          })(hi);
+        }
       }
+      headRound();
     }).catch(function () { try { res.statusCode = 502; res.end(); } catch (x) { } });
   }
 
@@ -25269,18 +25362,21 @@ function ytFilters(ext) {
             try { rec = await xfIssue(ep, attempt > 0); } catch (err) { }
           }
           if (!rec || !rec.url) return playObj("", { ua: uaOf(req), error: "稀饭：该集未取到可用播放地址" });
-          var cdnH = { "User-Agent": XF_CDN_UA, Referer: XF.host + "/" };
+          /* 注意：移动云盘终链（hydownload.pan.wo.cn）带 Referer 会直接 400，Range 也不认 */
+          var cdnH = { "User-Agent": XF_CDN_UA };
           if (/\.m3u8(\?|#|$)/i.test(rec.url)) {
             return playObj(rec.url, { ua: uaOf(req),  header: cdnH });
           }
           var it = {
-            url: rec.url, headers: cdnH, size: rec.size || 0,
+            url: rec.url, headers: cdnH, size: rec.size || 0, alts: (rec.alts || []).slice(),
             refresh: function () {
               return xfIssue(ep, true).then(function (nx) {
                 return (nx && nx.url) ? { url: nx.url, headers: cdnH } : null;
               });
             }
           };
+          /* /play 返回时就把 302 解析掉：播放器连上来时直链已就绪，首块少等 300-600ms */
+          try { xfResolve(it); } catch (e_warm) { }
           var relay = xfRelayUrl(req, it);
           return playObj(relay || rec.url, { ua: uaOf(req),  header: { "User-Agent": XF_CDN_UA } });
         };
