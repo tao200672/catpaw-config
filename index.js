@@ -21951,7 +21951,15 @@ ${X.map(te=>te.name).join(`
     }
     return "";
   }
-  /* ============================ 稀饭动漫 ============================ */
+  /* ================= 稀饭动漫（next.xifanacg.com）· 纯 API 数据层 + 三线稳定播放 =================
+     数据：Supabase REST（api.xifanacg.com），只取展示必需字段，列表/详情/取链全部内存缓存。
+     线路：恒定三条，不随候选临时缺失而消失（这正是之前"有时候只剩备用-1"的根因）——
+           稀饭新番主线-1 = 移动云盘（apn.moedot.net 302 到 pan.wo.cn）
+           稀饭新番主线-2 = xfvod（play.xfvod.pro:8088）
+           稀饭备用-1     = HLS（dl.playxf.top），先探健康度，慢/坏就自动回落 MP4，不会空播
+     播放：MP4 走本机多路 Range 代理：首块 1MB 拆 8×128KB 渐进下发（moov 约 994KB，必须凑满
+           才能起播），之后 16 路 × 1MB 顺序拼装（实测 3.6-4.0MB/s；单连接只有 0.4-0.5MB/s）。 */
+
   var XF = {
     base: "https://api.xifanacg.com",
     host: "https://next.xifanacg.com",
@@ -21968,53 +21976,110 @@ ${X.map(te=>te.name).join(`
       };
     }
   };
+
+  /* 三条线路名，固定不变 */
+  var XF_L1 = "稀饭新番主线-1";
+  var XF_L2 = "稀饭新番主线-2";
+  var XF_L3 = "稀饭备用-1";
+  var XF_LINES = [XF_L1, XF_L2, XF_L3];
+
   var XF_CATS = [
-    ["1", "连载新番", { typeId: 1 }],
-    ["2", "完结旧番", { typeId: 2 }],
-    ["3", "剧场版", { typeId: 3 }],
-    ["4", "美漫", { typeId: 4 }],
+    ["1", "连载新番", { typeId: 1, sort: "updated_at" }],
+    ["2", "完结旧番", { typeId: 2, sort: "updated_at" }],
+    ["3", "剧场版", { typeId: 3, sort: "updated_at" }],
+    ["4", "美漫", { typeId: 4, sort: "updated_at" }],
     ["hot", "热门播放", { sort: "view_count" }],
     ["score", "高分好评", { sort: "bangumi_score" }],
     ["new", "最近上新", { sort: "created_at" }],
-    ["tv", "TV动画", { fmt: "tv" }],
-    ["movie", "剧场动画", { fmt: "movie" }],
-    ["ova", "OVA", { fmt: "ova" }],
-    ["web", "WEB动画", { fmt: "web" }],
-    ["fin", "已完结", { fin: true }],
-    ["ing", "连载中", { fin: false }],
-    ["y2026", "2026年", { year: 2026 }],
-    ["y2025", "2025年", { year: 2025 }],
-    ["y2024", "2024年", { year: 2024 }],
-    ["y2023", "2023年", { year: 2023 }]
+    ["tv", "TV动画", { fmt: "tv", sort: "updated_at" }],
+    ["movie", "剧场动画", { fmt: "movie", sort: "updated_at" }],
+    ["ova", "OVA", { fmt: "ova", sort: "updated_at" }],
+    ["web", "WEB动画", { fmt: "web", sort: "updated_at" }],
+    ["fin", "已完结", { fin: true, sort: "updated_at" }],
+    ["ing", "连载中", { fin: false, sort: "updated_at" }],
+    ["y2026", "2026年", { year: 2026, sort: "updated_at" }],
+    ["y2025", "2025年", { year: 2025, sort: "updated_at" }],
+    ["y2024", "2024年", { year: 2024, sort: "updated_at" }],
+    ["y2023", "2023年", { year: 2023, sort: "updated_at" }]
   ];
 
   function xfCat(tid) {
     var s = String(tid == null ? "" : tid).trim();
     for (var i = 0; i < XF_CATS.length; i++) if (XF_CATS[i][0] === s) return XF_CATS[i];
-    return [s, s, {}];
+    return [s || "1", s || "连载新番", { typeId: 1, sort: "updated_at" }];
   }
-  function xfQuery(tid, page, wd) {
-    var c = xfCat(tid)[2];
-    var o = {
-      page_number: page > 0 ? page : 1,
-      items_per_page: 24,
-      sort_by: c.sort || "updated_at",
-      sort_order: "desc",
-      filter_only_published: true
-    };
-    if (wd) o.search_term = String(wd).trim();
-    if (c.typeId) o.filter_type_id = c.typeId;
-    if (c.fmt) o.filter_format = c.fmt;
-    if (c.fin !== undefined) o.filter_is_finished = c.fin;
-    if (c.year) o.filter_release_year = c.year;
-    return o;
+
+  /* API 走 keep-alive：稀饭接口每次新建 TLS 要 300-500ms，复用连接后列表/详情能快一半 */
+  var XF_AGENT = new (require("https").Agent)({ keepAlive: true, maxSockets: 24, maxFreeSockets: 12, keepAliveMsecs: 15000 });
+  function xfApi(u, opt) {
+    opt = opt || {};
+    return new Promise(function (resolve, reject) {
+      var p;
+      try { p = new URL(u); } catch (e) { return reject(e); }
+      var lib = require("https");
+      var body = opt.body ? Buffer.from(JSON.stringify(opt.body)) : null;
+      var headers = Object.assign({}, XF.h(), { "Accept-Encoding": "gzip, deflate" }, opt.headers || {});
+      if (body) { headers["Content-Type"] = "application/json"; headers["Content-Length"] = String(body.length); }
+      var r = lib.request({
+        protocol: p.protocol, hostname: p.hostname, port: p.port || 443,
+        path: p.pathname + p.search, method: body ? "POST" : "GET",
+        headers: headers, agent: XF_AGENT, timeout: opt.timeout || 12000
+      }, function (res) {
+        var code = res.statusCode || 0;
+        if (code >= 301 && code <= 308 && res.headers.location) {
+          try { res.resume(); } catch (e0) { }
+          var nx;
+          try { nx = new URL(res.headers.location, u).toString(); } catch (e1) { return reject(e1); }
+          return resolve(xfApi(nx, opt));
+        }
+        var stream = res, enc = String(res.headers["content-encoding"] || "").toLowerCase();
+        try {
+          if (enc.indexOf("gzip") >= 0) stream = res.pipe(require("zlib").createGunzip());
+          else if (enc.indexOf("deflate") >= 0) stream = res.pipe(require("zlib").createInflate());
+        } catch (e2) { stream = res; }
+        var chunks = [];
+        stream.on("data", function (c) { chunks.push(c); });
+        stream.on("end", function () { resolve({ status: code, headers: res.headers, body: Buffer.concat(chunks).toString("utf8") }); });
+        stream.on("error", reject);
+      });
+      r.on("error", reject);
+      r.on("timeout", function () { r.destroy(new Error("timeout")); });
+      if (body) r.write(body);
+      r.end();
+    });
   }
+
+  function xfQs(o) {
+    var p = [];
+    Object.keys(o).forEach(function (k) {
+      var v = o[k];
+      if (v === undefined || v === null || v === "") return;
+      p.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v)));
+    });
+    return p.join("&");
+  }
+
+  /* ---------- 内存缓存：列表 90s、详情 5min、取链 6min，避免来回切页重复打接口 ---------- */
+  var XF_MEM = {};
+  function xfMemGet(k) {
+    var c = XF_MEM[k];
+    if (!c) return null;
+    if (c.exp && c.exp < Date.now()) { delete XF_MEM[k]; return null; }
+    return c.v;
+  }
+  function xfMemSet(k, v, ttl) {
+    XF_MEM[k] = { v: v, exp: Date.now() + (ttl || 60000) };
+    var ks = Object.keys(XF_MEM);
+    if (ks.length > 500) ks.slice(0, 150).forEach(function (x) { delete XF_MEM[x]; });
+    return v;
+  }
+
   function xfVod(it) {
     if (!it) return null;
     var id = it.id;
     if (id === undefined || id === null || String(id) === "") return null;
     var name = it.title || it.title_original || "";
-    var pic = String(it.cover_url || "").replace("img2.xfmanga.top", "img.xfmanga.top");
+    var pic = String(it.cover_url || "");
     var cur = Number(it.current_episodes || 0), tot = Number(it.total_episodes || 0);
     var rem = "";
     if (it.is_finished) rem = tot > 0 ? ("全" + tot + "集") : "已完结";
@@ -22022,6 +22087,7 @@ ${X.map(te=>te.name).join(`
     var content = String(it.description || "").trim();
     var tags = it.meta_tags;
     if (tags && tags.length) content += "\n标签：" + tags.slice(0, 8).join(" / ");
+    var actors = it.actors;
     return {
       vod_id: String(id),
       vod_name: String(name),
@@ -22032,66 +22098,213 @@ ${X.map(te=>te.name).join(`
       vod_lang: "日语",
       vod_score: String(it.bangumi_score || ""),
       vod_director: String(it.director || ""),
+      vod_actor: Array.isArray(actors) ? actors.slice(0, 6).join(" / ") : "",
+      type_name: String(it.format_label || it.format || ""),
       vod_content: content
     };
   }
-  async function xfRpc(tid, page, wd) {
-    var r = await postJson(XF.base + "/rest/v1/rpc/search_animes", xfQuery(tid, page, wd), XF.h(), 20000);
+
+  var XF_SEL_LIST = "id,title,title_original,cover_url,current_episodes,total_episodes,is_finished,bangumi_score,release_year,region,format,updated_at";
+  var XF_SEL_DETAIL = "id,title,title_original,cover_url,description,release_year,region,director,actors,current_episodes,total_episodes,is_finished,bangumi_score,meta_tags,format,episodes(id,episode_number,title,kind)";
+
+  /* 列表：REST 直查（比 rpc/search_animes 少 60% 体积），total 从 content-range 取 */
+  async function xfList(tid, page, wd) {
+    page = Number(page) > 0 ? Math.floor(Number(page)) : 1;
+    var key = "L:" + tid + ":" + page + ":" + (wd || "");
+    var hit = xfMemGet(key);
+    if (hit) return hit;
+
+    var c = xfCat(tid)[2];
+    var limit = 24;
+    var q = { select: XF_SEL_LIST, limit: String(limit), offset: String((page - 1) * limit) };
+    if (wd) {
+      var w = String(wd).trim().replace(/[(),*]/g, " ");
+      q.or = "(title.ilike.*" + w + "*,search_title.ilike.*" + w + "*)";
+    } else {
+      q.is_published = "eq.true";
+      if (c.typeId) q.type_id = "eq." + c.typeId;
+      if (c.fmt) q.format = "eq." + c.fmt;
+      if (c.fin !== undefined) q.is_finished = "eq." + c.fin;
+      if (c.year) q.release_year = "eq." + c.year;
+    }
+    q.order = (c.sort || "updated_at") + ".desc";
+
+    var r = await xfApi(XF.base + "/rest/v1/animes?" + xfQs(q), { headers: { Prefer: "count=exact" }, timeout: 15000 });
     var arr = js(r.body);
-    if (!Array.isArray(arr)) return { list: [], total: 0 };
-    var total = 0;
-    if (arr.length && arr[0] && arr[0].total_count !== undefined) total = Number(arr[0].total_count) || 0;
     var list = [];
-    for (var i = 0; i < arr.length; i++) { var v = xfVod(arr[i]); if (v) list.push(v); }
-    return { list: list, total: total || list.length };
+    if (Array.isArray(arr)) {
+      for (var i = 0; i < arr.length; i++) { var v = xfVod(arr[i]); if (v) list.push(v); }
+    }
+    var total = list.length;
+    var cr = String((r.headers && r.headers["content-range"]) || "");
+    var m = /\/(\d+)\s*$/.exec(cr);
+    if (m) total = Number(m[1]) || total;
+    var out = { list: list, total: total, page: page, pagecount: Math.max(1, Math.ceil(total / limit)), limit: limit };
+    return xfMemSet(key, out, 90 * 1000);
   }
 
-  /* ======================== 稀饭播放加速（多路 Range 代理） ========================
-     稀饭的播放直链是单连接 CDN：实测单连接 0.4-1MB/s，8-16 路并发可聚合到 ~2.7MB/s。
-     所以 /play 不再直接吐直链，而是返回本地 /proxy/raw/<sid>：
-       · 起播首块 256KB 拆 8 路 32KB 并发，不等单连接爬完
-       · 之后 16 路 × 128KB 顺序拼装，回看缓存 16MB（小 seek 直接命中）
-       · 取链结果按集缓存 8 分钟（签名在 expires_at 前一直有效），403 时自动重新签发
-     HLS（.m3u8）线路不套代理，直接交给播放器。 */
-  var XF_CDN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-  /* 实测（移动云盘终链）：单请求延迟 0.3-1s，吞吐≈分块大小/RTT。
-     64KB 分块 16 路仅 2MB/s；1MB 分块 16 路到 5.9MB/s。故取 1MB。 */
-  /* 实测该 CDN：单请求延迟恒定≈650ms（与并发无关），吞吐随并发线性增长。
-     故首块只抓 64KB 立刻下发（起播不等全部就绪），moov 剩下的部分交给
-     16 路 x 1MB 窗口并行补齐（16x1MB 实测 2.2-4.9MB/s）。 */
-  var XF_RL_W = 16, XF_RL_CHUNK = 262144, XF_RL_HEAD = 65536, XF_RL_HW = 1, XF_RL_CACHE = 32 << 20;
-  var XF_ITEMS = {}, XF_SEQ = 0, XF_PLAY_CACHE = {};
+  /* 首页：三段并行拉（连载新番 / 最近上新 / 高口碑），去重后给 24 条 */
+  async function xfHome() {
+    var hit = xfMemGet("HOME");
+    if (hit) return hit;
+    var jobs = [
+      xfList("1", 1, "").catch(function () { return { list: [] }; }),
+      xfList("new", 1, "").catch(function () { return { list: [] }; }),
+      xfList("score", 1, "").catch(function () { return { list: [] }; })
+    ];
+    var rs = await Promise.all(jobs);
+    var seen = {}, list = [];
+    rs.forEach(function (r) {
+      (r.list || []).forEach(function (v) {
+        if (!v || seen[v.vod_id]) return;
+        seen[v.vod_id] = 1;
+        list.push(v);
+      });
+    });
+    var out = {
+      "class": XF_CATS.map(function (c2) { return { type_id: c2[0], type_name: c2[1] }; }),
+      filters: {},
+      list: list.slice(0, 24)
+    };
+    return xfMemSet("HOME", out, 90 * 1000);
+  }
 
-  async function xfIssue(ep, force) {
-    var key = String(ep), now = Date.now(), c = XF_PLAY_CACHE[key];
-    if (!force && c && c.at && (now - c.at) < 8 * 60 * 1000 && (!c.exp || c.exp * 1000 > now + 60 * 1000)) return c;
-    var r = await postJson(XF.base + "/functions/v1/issue-web-playback", { action: "fallback", episode_id: Number(ep) }, XF.h(), 20000);
-    var j = js(r.body) || {};
-    var u = (j && j.url) ? String(j.url) : ((j && j.playback && j.playback.url) ? String(j.playback.url) : "");
-    if (!u) return null;
-    var size = 0;
-    try {
-      var cs = j.candidates || [];
-      for (var i = 0; i < cs.length; i++) if (cs[i] && cs[i].url === u) { size = Number(cs[i].expected_bytes || 0) || 0; break; }
-    } catch (e0) { }
-    var alts = [];
-    try {
-      var cs0 = j.candidates || [];
-      for (var ci = 0; ci < cs0.length; ci++) {
-        var cu = cs0[ci] && cs0[ci].url;
-        if (!cu || cu === u) continue;
-        /* 只要 MP4 候选；m3u8 没有字节区间语义，不能走 Range 代理 */
-        if (/\.m3u8(\?|#|$)/i.test(String(cu))) continue;
-        alts.push(String(cu));
+  /* 详情：一条请求带出剧集（嵌套 episodes），比"详情+剧集"两次往返快一倍 */
+  async function xfDetail(id) {
+    id = String(id || "").trim();
+    if (!id) return null;
+    var key = "D:" + id;
+    var hit = xfMemGet(key);
+    if (hit) return hit;
+
+    var r = await xfApi(XF.base + "/rest/v1/animes?" + xfQs({ id: "eq." + id, select: XF_SEL_DETAIL, limit: "1" }), { timeout: 15000 });
+    var arr = js(r.body);
+    var a = (Array.isArray(arr) && arr[0]) ? arr[0] : null;
+    if (!a) return null;                       /* 不存在的 id：直接返回空，不造假条目 */
+    var eps = Array.isArray(a.episodes) ? a.episodes : [];
+    if (!eps.length) {
+      var r2 = await xfApi(XF.base + "/rest/v1/episodes?" + xfQs({ anime_id: "eq." + id, select: "id,episode_number,title,kind", order: "episode_number.asc", limit: "3000" }), { timeout: 15000 });
+      var e2 = js(r2.body);
+      if (Array.isArray(e2)) eps = e2;
+    }
+    eps = eps.filter(function (x) { return x && x.id !== undefined && x.id !== null; });
+    eps.sort(function (x, y) { return (Number(x.episode_number) || 0) - (Number(y.episode_number) || 0); });
+
+    var parts = [];
+    for (var i = 0; i < eps.length; i++) {
+      var n = (eps[i].episode_number === undefined || eps[i].episode_number === null) ? (i + 1) : Math.floor(Number(eps[i].episode_number));
+      var t = String(eps[i].title || "").trim();
+      parts.push("第" + (n < 10 ? "0" + n : n) + "集" + (t ? " " + t : "") + "$" + eps[i].id);
+    }
+
+    var v = xfVod(a) || { vod_id: id, vod_name: id };
+    /* 三条线路恒定输出，播放地址用同一份剧集表 —— 候选哪天缺一条也不会让线路消失 */
+    var epsStr = parts.join("#");
+    v.vod_play_from = XF_LINES.join("$$$");
+    v.vod_play_url = [epsStr, epsStr, epsStr].join("$$$");
+    if (parts.length) v.vod_remarks = (v.vod_remarks ? v.vod_remarks + " · " : "") + "3线";
+    var out = { list: [v] };
+
+    /* 后台预热：第一集的播放票据 + HLS 健康度，用户点播放时基本零等待 */
+    if (eps.length) {
+      var ep0 = String(eps[0].id);
+      setTimeout(function () {
+        try { xfTicket(ep0).catch(function () { }); } catch (e0) { }
+      }, 0);
+    }
+    return xfMemSet(key, out, 5 * 60 * 1000);
+  }
+
+  /* ---------- 播放票据：按集缓存，含所有 MP4 候选 + HLS，供三条线路各取所需 ---------- */
+  var XF_TICKET = {};
+  function xfTicket(ep, force) {
+    var k = String(ep), now = Date.now(), c = XF_TICKET[k];
+    if (!force && c && (now - c.at) < 6 * 60 * 1000 && (!c.exp || c.exp * 1000 > now + 120000)) return Promise.resolve(c);
+    return xfApi(XF.base + "/functions/v1/issue-web-playback", { body: { action: "fallback", episode_id: Number(ep) }, timeout: 15000 }).then(function (r) {
+      var j = js(r.body) || {};
+      var main = j.url ? String(j.url) : "";
+      var mp4 = [], hls = "", sizes = {};
+      (j.candidates || []).forEach(function (x) {
+        var u = (x && x.url) ? String(x.url) : "";
+        if (!u) return;
+        sizes[u] = Number(x.expected_bytes || 0) || 0;
+        if (/\.m3u8(\?|#|$)/i.test(u)) { if (!hls) hls = u; return; }
+        if (mp4.indexOf(u) < 0) mp4.push(u);
+      });
+      if (main) {
+        if (/\.m3u8(\?|#|$)/i.test(main)) { if (!hls) hls = main; }
+        else if (mp4.indexOf(main) < 0) mp4.unshift(main);
       }
-    } catch (e2) { }
-    var rec = { url: u, size: size, exp: Number(j.expires_at || 0) || 0, at: now, alts: alts };
-    XF_PLAY_CACHE[key] = rec;
-    var ks = Object.keys(XF_PLAY_CACHE);
-    if (ks.length > 200) ks.slice(0, 60).forEach(function (k) { delete XF_PLAY_CACHE[k]; });
-    return rec;
+      var rec = { mp4: mp4, hls: hls, sizes: sizes, finals: {}, exp: Number(j.expires_at || 0) || 0, at: now };
+      if (mp4.length || hls) XF_TICKET[k] = rec;
+      var ks = Object.keys(XF_TICKET);
+      if (ks.length > 300) ks.slice(0, 100).forEach(function (x) { delete XF_TICKET[x]; });
+      return rec;
+    }).catch(function () { return null; });
   }
 
+  /* ---------- HLS 健康度：dl.playxf.top 实测只有 56-300KB/s 且偶发 ECONNRESET，
+     所以备用线必须先验证"能拿且不慢"，不达标直接回落 MP4，避免用户点进去空转 ---------- */
+  var XF_HLSV = {};
+  function xfCollect(res, cap, timeoutMs) {
+    return new Promise(function (resolve) {
+      var buf = [], n = 0, done = false;
+      function fin() {
+        if (done) return; done = true;
+        var b = Buffer.concat(buf);
+        resolve({ n: n, buf: b, text: b.toString("utf8") });
+      }
+      res.on("data", function (c) {
+        if (done) return;
+        n += c.length; buf.push(c);
+        if (cap && n >= cap) { fin(); try { res.destroy(); } catch (e0) { } }
+      });
+      res.on("end", fin);
+      res.on("error", fin);
+      if (timeoutMs) setTimeout(fin, timeoutMs);
+    });
+  }
+
+  async function xfHlsOk(rec, ep) {
+    var k = String(ep), c = XF_HLSV[k];
+    if (c && (Date.now() - c.at) < 10 * 60 * 1000) return c.ok;
+    var ok = false;
+    if (!rec || !rec.hls) {
+      XF_HLSV[k] = { ok: false, at: Date.now() };
+      return false;
+    }
+    try {
+      var r1 = await xfHttpGet(rec.hls, { "User-Agent": XF_CDN_UA }, 1200);
+      if (r1.statusCode === 200) {
+        var t1 = await xfCollect(r1, 96 * 1024, 900);
+        var segs = String(t1.text || "").split("\n").map(function (s) { return s.trim(); })
+          .filter(function (l) { return l && l.charAt(0) !== "#"; });
+        if (segs.length) {
+          var seg = segs[0];
+          try { seg = new URL(seg, rec.hls).toString(); } catch (e1) { }
+          var t0 = Date.now();
+          var r2 = await xfHttpGet(seg, { "User-Agent": XF_CDN_UA, Range: "bytes=0-131071", "Accept-Encoding": "identity" }, 1000);
+          if (r2.statusCode === 200 || r2.statusCode === 206) {
+            var got = await xfCollect(r2, 131072, 1000);
+            var secs = Math.max(0.25, (Date.now() - t0) / 1000);
+            var kbs = got.n / 1024 / secs;
+            ok = got.n >= 65536 && kbs >= 500;
+          }
+        }
+      }
+    } catch (e2) { ok = false; }
+    XF_HLSV[k] = { ok: ok, at: Date.now() };
+    return ok;
+  }
+
+  /* ======================== 多路 Range 代理 ======================== */
+  var XF_CDN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+  /* 实测：该 CDN 单连接 0.3-2MB/s 且波动大；首块 8×128KB 并行能把 moov(994KB) 压到 1-1.5s，
+       之后 16 路×1MB 拉满（裸测 16 路聚合 2.7-4.8MB/s）。首块期间不预取，避免抢带宽拖慢起播。 */
+  var XF_RL_W = 16, XF_RL_CHUNK = 1 << 20, XF_RL_HEAD = 1 << 20, XF_RL_HW = 8, XF_RL_PREFILL = 0, XF_RL_CACHE = 32 << 20;
+  var XF_ITEMS = {}, XF_SEQ = 0;
+
+  /* 跟随 3xx：稀饭主链 302 到移动云盘，不跟随就会把 302 当失败 */
   function xfHttpGet(u, headers, timeout, depth) {
     depth = depth || 0;
     return new Promise(function (resolve, reject) {
@@ -22102,7 +22315,6 @@ ${X.map(te=>te.name).join(`
         protocol: p.protocol, hostname: p.hostname, port: p.port || (p.protocol === "http:" ? 80 : 443),
         path: p.pathname + p.search, method: "GET", headers: headers || {}, timeout: timeout || 30000
       }, function (res) {
-        /* 稀饭主链会 302 跳 CDN（apn.moedot.net 等）：不跟随就永远拿不到 206 */
         var code = res.statusCode || 0;
         if (code === 301 || code === 302 || code === 303 || code === 307 || code === 308) {
           var loc = res.headers && res.headers.location;
@@ -22112,7 +22324,7 @@ ${X.map(te=>te.name).join(`
             try { next = new URL(loc, u).toString(); } catch (e1) { return reject(e1); }
             return resolve(xfHttpGet(next, headers, timeout, depth + 1));
           }
-          return reject(new Error("redirect " + code + " no location"));
+          return reject(new Error("redirect " + code));
         }
         res.__url = u;
         resolve(res);
@@ -22123,25 +22335,73 @@ ${X.map(te=>te.name).join(`
     });
   }
 
-  /* 解析 302 一次并缓存最终直链：否则每个分块都要多花 200-600ms 走一次跳转 */
+  function xfRange(it, s, e, tries) {
+    tries = tries || 3;
+    var want = e - s + 1;
+    function attempt(n) {
+      if (n > tries) return Promise.resolve(Buffer.alloc(0));
+      return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=" + s + "-" + e, "Accept-Encoding": "identity" }))
+        .then(function (res) {
+          if (res.statusCode !== 200 && res.statusCode !== 206) {
+            try { res.resume(); } catch (x0) { }
+            if (it.refresh && n === 1) {
+              return Promise.resolve(it.refresh()).then(function (nx) {
+                if (nx && nx.url) { it.url = nx.url; it.headers = nx.headers || it.headers; it.final = ""; }
+                return attempt(n + 1);
+              }).catch(function () { return attempt(n + 1); });
+            }
+            return attempt(n + 1);
+          }
+          if (res.__url && res.__url !== it.url) {
+            it.url = res.__url;
+            if (it.onFinal) { try { it.onFinal(res.__url); } catch (e_f) { } }
+          }
+          return new Promise(function (resolve) {
+            var buf = [], got = 0, done = false;
+            function fin(b) { if (!done) { done = true; resolve(b); } }
+            res.on("data", function (c) {
+              if (done) return;
+              buf.push(c); got += c.length;
+              if (got >= want) { fin(Buffer.concat(buf).slice(0, want)); try { res.resume(); } catch (x1) { } }
+            });
+            res.on("end", function () { fin(got >= want ? Buffer.concat(buf).slice(0, want) : Buffer.alloc(0)); });
+            res.on("error", function () { fin(Buffer.alloc(0)); });
+          }).then(function (b) { return b.length === want ? b : attempt(n + 1); });
+        }).catch(function () { return attempt(n + 1); });
+    }
+    return attempt(1);
+  }
+
+  function xfSize(it) {
+    if (it.size) return Promise.resolve(it.size);
+    return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=0-0", "Accept-Encoding": "identity" }), 12000).then(function (res) {
+      var m = /\/(\d+)\s*$/.exec(String(res.headers["content-range"] || ""));
+      if (res.__url && res.__url !== it.url) it.url = res.__url;
+      try { res.resume(); } catch (x) { }
+      if (m) it.size = Number(m[1]);
+      return it.size || 0;
+    }).catch(function () { return 0; });
+  }
+
+  /* 解析 302 一次并缓存：播放器连上来时直链已就绪，省掉每块一次跳转 */
   function xfResolve(it) {
     if (it.final) return Promise.resolve(it.final);
     if (it.resolving) return it.resolving;
-    it.resolving = xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=0-1", "Accept-Encoding": "identity" }), 12000).then(function (res) {
+    it.resolving = xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=0-1", "Accept-Encoding": "identity" }), 10000).then(function (res) {
       var m = /\/(\d+)\s*$/.exec(String(res.headers["content-range"] || ""));
       if (m) it.size = Number(m[1]) || it.size;
-      if (res.__url) { it.final = res.__url; it.url = res.__url; }
-      try { res.destroy(); } catch (e0) { }
+      if (res.__url) {
+        it.final = res.__url; it.url = res.__url;
+        if (it.onFinal) { try { it.onFinal(res.__url); } catch (e0) { } }
+      }
+      try { res.destroy(); } catch (e1) { }
       it.resolving = null;
       return it.final || it.url;
-    }).catch(function () {
-      it.resolving = null;
-      return it.url;
-    });
+    }).catch(function () { it.resolving = null; return it.url; });
     return it.resolving;
   }
 
-  /* 兜底：单连接直连顺序下推（多路被 CDN 拒时仍能播，不会干等） */
+  /* 兜底：单连接直推（多路被 CDN 拒时仍能播，不会干等） */
   function xfPipeDirect(it, res, start, end) {
     return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=" + start + "-" + end, "Accept-Encoding": "identity" }), 30000).then(function (r) {
       var skip = (r.statusCode === 200 && start > 0) ? start : 0;
@@ -22163,49 +22423,23 @@ ${X.map(te=>te.name).join(`
     }).catch(function () { try { res.end(); } catch (e) { } });
   }
 
-  function xfRange(it, s, e, tries) {
-    tries = tries || 3;
-    var want = e - s + 1;
-    function attempt(n) {
-      if (n > tries) return Promise.resolve(Buffer.alloc(0));
-      return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=" + s + "-" + e, "Accept-Encoding": "identity" }))
-        .then(function (res) {
-          if (res.statusCode !== 200 && res.statusCode !== 206) {
-            try { res.resume(); } catch (x0) { }
-            if (it.refresh && n === 1) {
-              return Promise.resolve(it.refresh()).then(function (nx) {
-                if (nx && nx.url) { it.url = nx.url; it.headers = nx.headers || it.headers; }
-                return attempt(n + 1);
-              }).catch(function () { return attempt(n + 1); });
-            }
-            return attempt(n + 1);
-          }
-          if (res.__url && res.__url !== it.url) it.url = res.__url;
-          return new Promise(function (resolve) {
-            var buf = [], got = 0, done = false;
-            function fin(b) { if (!done) { done = true; resolve(b); } }
-            res.on("data", function (c) {
-              if (done) return;
-              buf.push(c); got += c.length;
-              if (got >= want) { fin(Buffer.concat(buf).slice(0, want)); try { res.resume(); } catch (x1) { } }
-            });
-            res.on("end", function () { fin(got >= want ? Buffer.concat(buf).slice(0, want) : Buffer.alloc(0)); });
-            res.on("error", function () { fin(Buffer.alloc(0)); });
-          }).then(function (b) { return b.length === want ? b : attempt(n + 1); });
-        }).catch(function () { return attempt(n + 1); });
+  /* /play 阶段就把首块 1MB 拆 8 片开始抓：播放器通常 100-300ms 后才连上来，
+     那时缓存里已有货，起播少等 0.3-0.6s。 */
+  function xfWarmHead(it) {
+    if (it.headWarm) return;
+    var hs = Math.ceil(XF_RL_HEAD / XF_RL_HW);
+    it.headWarmHS = hs;
+    it.headWarm = [];
+    for (var i = 0; i < XF_RL_HW; i++) {
+      (function (idx, s0) {
+        var hit = it.cache && it.cache[s0];
+        if (hit && hit.length === hs) { it.headWarm[idx] = Promise.resolve(hit); return; }
+        it.headWarm[idx] = xfRange(it, s0, s0 + hs - 1, 1).then(function (b) {
+          if (b && b.length === hs) xfCachePut(it, s0, b);
+          return b;
+        }).catch(function () { return null; });
+      })(i, i * hs);
     }
-    return attempt(1);
-  }
-
-  function xfSize(it) {
-    if (it.size) return Promise.resolve(it.size);
-    return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=0-0" }), 15000).then(function (res) {
-      if (res.__url && res.__url !== it.url) it.url = res.__url;
-      var m = /\/(\d+)\s*$/.exec(String(res.headers["content-range"] || ""));
-      try { res.resume(); } catch (x) { }
-      if (m) it.size = Number(m[1]);
-      return it.size || 0;
-    }).catch(function () { return 0; });
   }
 
   function xfCachePut(it, p, buf) {
@@ -22223,7 +22457,6 @@ ${X.map(te=>te.name).join(`
   function xfStream(req, res, it) {
     var closed = false;
     res.on("close", function () { closed = true; });
-    /* resolve 与首块并发跑：首块自己也会跟随 302，不必串行等它 */
     try { xfResolve(it); } catch (e_r) { }
     xfSize(it).then(function (total) {
       if (!total || total <= 0) { res.statusCode = 502; return res.end(); }
@@ -22249,8 +22482,7 @@ ${X.map(te=>te.name).join(`
         var sz = Math.min(XF_RL_CHUNK, end - p + 1), b = p + sz - 1;
         var hit = it.cache && it.cache[p];
         if (hit && hit.length === b - p + 1) { pending[p] = Promise.resolve(hit); return b + 1; }
-        var pr = xfRange(it, p, b, 3).then(function (x) { xfCachePut(it, p, x); return x; });
-        pending[p] = pr;
+        pending[p] = xfRange(it, p, b, 3).then(function (x) { xfCachePut(it, p, x); return x; });
         return b + 1;
       }
       function pump() {
@@ -22281,71 +22513,101 @@ ${X.map(te=>te.name).join(`
           });
         }).catch(function () { try { res.end(); } catch (x) { } });
       }
-      /* 首块 8 路 32KB 并发，按序渐进写出：第一片到就发，不等最慢的一片 */
-      var headWant = Math.min(XF_RL_HEAD, end - start + 1), hs = Math.ceil(headWant / XF_RL_HW);
-      var sliceN = Math.min(XF_RL_HW, Math.ceil(headWant / hs));
-      var slices = new Array(sliceN), wi = 0, doneN = 0, winStarted = false;
-      function flushHead() {
-        while (wi < sliceN && slices[wi] && slices[wi].length) {
-          var b = slices[wi]; slices[wi] = null; wi++;
-          outPos += b.length;
-          if (!closed) res.write(b);
-        }
+
+      /* 首块（moov 约 994KB）单连接流式直写：字节到多少发多少，不等凑满；
+         同时把后面 16×1MB 的窗口全部预取。首字节 ~0.3-0.6s，moov ~1.2-1.5s。 */
+      var headWant = Math.min(XF_RL_HEAD, end - start + 1);
+      var winStart = Math.min(start + headWant, end + 1);
+      var preQueued = [], prefilled = false, winStarted = false, headTried = false;
+
+      function prefill() {
+        if (prefilled) return;
+        prefilled = true;
+        var p2 = winStart, k = 0;
+        while (p2 <= end && k < XF_RL_PREFILL) { preQueued.push(p2); p2 = submit(p2); k++; }
+        nextPos = p2;
       }
       function startWindow() {
         if (winStarted) return;
         winStarted = true;
-        nextPos = outPos;
+        if (outPos !== winStart) {
+          /* 首块没写满：从断点继续，丢弃预取，保证不出现空洞 */
+          pending = {}; preQueued = []; prefilled = true; nextPos = outPos;
+          while (nextPos <= end && order.length < XF_RL_W) { order.push(nextPos); nextPos = submit(nextPos); }
+          return pump();
+        }
+        if (!prefilled) prefill();
+        for (var qi = 0; qi < preQueued.length; qi++) order.push(preQueued[qi]);
+        preQueued = [];
+        /* 首块已落地，把并发拉满到 16 路 */
         while (nextPos <= end && order.length < XF_RL_W) { order.push(nextPos); nextPos = submit(nextPos); }
         pump();
       }
-      var altTried = false;
-      function headRound() {
+
+      function headStream() {
+        var hs = Math.ceil(headWant / XF_RL_HW);
+        var sliceN = Math.min(XF_RL_HW, Math.ceil(headWant / hs));
+        var slices = new Array(sliceN), wi0 = 0, done0 = 0;
+        function flush() {
+          while (wi0 < sliceN && slices[wi0] && slices[wi0].length) {
+            var b = slices[wi0]; slices[wi0] = null; wi0++;
+            outPos += b.length;
+            if (!closed) { try { res.write(b); } catch (e0) { } }
+          }
+        }
         for (var hi = 0; hi < sliceN; hi++) {
           (function (idx) {
             var s0 = start + idx * hs, e0 = Math.min(s0 + hs - 1, start + headWant - 1);
-            xfRange(it, s0, e0, 2).then(function (b) {
+            var want2 = e0 - s0 + 1;
+            var cand = it.cache && it.cache[s0];
+            var run;
+            if (cand && cand.length === want2) run = Promise.resolve(cand);
+            else if (it.headWarm && it.headWarmHS === hs && headWant === XF_RL_HEAD && it.headWarm[idx]) {
+              run = it.headWarm[idx].then(function (b) {
+                return (b && b.length === want2) ? b : xfRange(it, s0, e0, 2);
+              });
+            } else run = xfRange(it, s0, e0, 2);
+            run.then(function (b) {
               slices[idx] = b || Buffer.alloc(0);
             }).catch(function () {
               slices[idx] = Buffer.alloc(0);
             }).then(function () {
-              flushHead();
-              doneN++;
-              if (slices[idx] === null || (slices[idx] && slices[idx].length)) got++;
-              if (doneN < sliceN || closed) return;
-              if (wi > 0) return startWindow();
-              /* 首块一个字都没拿到：换备用 CDN 再试一轮，仍不行就断开，别让播放器干等 */
-              var alts = (it.alts || []).filter(function (u) { return u && u !== it.url; });
-              if (!altTried && alts.length) {
-                altTried = true;
-                it.url = alts[0];
-                it.final = "";
-                it.alts = alts.slice(1);
-                slices = new Array(sliceN); wi = 0; doneN = 0;
-                return headRound();
-              }
-              /* 多路彻底不可用：退回单连接直推，至少能播 */
-              xfPipeDirect(it, res, start, end);
+              flush();
+              done0++;
+              if (closed) return;
+              if (done0 >= sliceN) startWindow();
             });
           })(hi);
         }
       }
-      headRound();
+      function headAlt() {
+        if (closed) return;
+        var alts = (it.alts || []).filter(function (u) { return u && u !== it.url; });
+        if (!headTried && alts.length) {
+          headTried = true;
+          it.url = alts[0]; it.final = ""; it.alts = alts.slice(1);
+          pending = {}; order = []; preQueued = []; prefilled = false;
+          return headStream();
+        }
+        xfPipeDirect(it, res, start, end);
+      }
+
+      prefill();
+      headStream();
     }).catch(function () { try { res.statusCode = 502; res.end(); } catch (x) { } });
   }
 
   function xfRelayUrl(req, it) {
     XF_SEQ++;
-    var sid = ((XF_SEQ * 2654435761) >>> 0).toString(16);
+    var sid = ((Date.now() % 100000) * 1000 + (XF_SEQ % 1000)).toString(36);
     XF_ITEMS[sid] = it;
     var ks = Object.keys(XF_ITEMS);
-    if (ks.length > 12) ks.slice(0, ks.length - 12).forEach(function (k) { delete XF_ITEMS[k]; });
+    if (ks.length > 24) ks.slice(0, ks.length - 24).forEach(function (k) { delete XF_ITEMS[k]; });
     var host = (req && req.headers && (req.headers.host || req.headers.Host)) || "";
     if (!host) return "";
     var root = /^https?:\/\//i.test(host) ? host : "http://" + host;
     return root + "/spider/xifan/3/proxy/raw/" + sid;
   }
-
   /* ============================ GiriGiri爱 ============================ */
   /* 2026-11 改版：旧接口 m3u8.girigirilove.com/api.php 已不再返回 JSON（直接吐 PHP 源码、
      根路径 500），现站是苹果CMS 模板 bg.girigirilove.com：
@@ -25308,94 +25570,120 @@ function ytFilters(ext) {
     {
       meta: { key: "xifan", name: "🍚 稀饭动漫", type: 3 },
       api: async function (e) {
+        /* 注册时预热一次连接（DNS+TLS 约 300-800ms），否则用户第一次进站要白等这一段 */
+        setTimeout(function () {
+          try { xfApi(XF.base + "/rest/v1/animes?select=id&limit=1", { timeout: 6000 }).catch(function () { }); } catch (e0) { }
+        }, 1200);
+
+        /* 首页：三段并行 + 90s 缓存 */
         e.post("/home", async function () {
-          var out = { "class": XF_CATS.map(function (c) { return { type_id: c[0], type_name: c[1] }; }), list: [] };
-          try {
-            var r = await xfRpc("1", 1, "");
-            if (r.list.length < 8) {
-              var r2 = await xfRpc("3", 1, "");
-              r.list = r.list.concat(r2.list);
-            }
-            out.list = r.list.slice(0, 18);
-          } catch (err) { }
-          return out;
+          try { return await xfHome(); } catch (err) {
+            return { "class": XF_CATS.map(function (c) { return { type_id: c[0], type_name: c[1] }; }), filters: {}, list: [] };
+          }
         });
+
         e.post("/category", async function (req) {
           var b = body(req);
-          var page = Number(b.page || 1);
-          var r = await xfRpc(String(b.id || "1"), page, b.filters && b.filters.wd);
-          return { page: page, pagecount: Math.max(1, Math.ceil((r.total || r.list.length) / 24)), limit: 24, total: r.total, list: r.list };
+          var page = Number(b.page || b.pg || 1) || 1;
+          var wd = (b.filters && (b.filters.wd || b.filters.search)) || b.wd || "";
+          try {
+            var r = await xfList(String(b.id || b.type_id || "1"), page, wd);
+            return { page: r.page, pagecount: r.pagecount, limit: r.limit, total: r.total, list: r.list };
+          } catch (err) {
+            return { page: page, pagecount: 1, limit: 24, total: 0, list: [] };
+          }
         });
+
+        e.post("/search", async function (req) {
+          var b = body(req);
+          var wd = String(b.wd || b.key || "").trim();
+          if (!wd) return { page: 1, pagecount: 1, total: 0, list: [] };
+          var page = Number(b.page || b.pg || 1) || 1;
+          try {
+            var r = await xfList("", page, wd);
+            return { page: r.page, pagecount: r.pagecount, limit: r.limit, total: r.total, list: r.list };
+          } catch (err) {
+            return { page: page, pagecount: 1, total: 0, list: [] };
+          }
+        });
+
+        /* 详情：一次请求带出剧集，恒定输出三条线路 */
         e.post("/detail", async function (req) {
           var b = body(req);
-          var ids = Array.isArray(b.id) ? b.id : [b.id];
+          var ids = Array.isArray(b.id) ? b.id : [b.id || b.vod_id];
           var id = String(ids[0] || "").trim();
+          if (id.indexOf("$") > 0) id = id.slice(id.indexOf("$") + 1);
           if (!id) return { list: [] };
-          var r = await get(XF.base + "/rest/v1/animes?" + qs({ id: "eq." + id, select: "*,episodes(id,episode_number,title,kind,release_date,duration_seconds)", limit: "1" }), XF.h(), 25000);
-          var arr = js(r.body);
-          var a = (Array.isArray(arr) && arr[0]) ? arr[0] : {};
-          var eps = a.episodes || [];
-          if (!eps.length) {
-            var r2 = await get(XF.base + "/rest/v1/episodes?" + qs({ anime_id: "eq." + id, select: "id,episode_number,title,kind,release_date,duration_seconds", order: "episode_number.asc", limit: "2000" }), XF.h(), 30000);
-            eps = js(r2.body) || [];
+          try {
+            var d = await xfDetail(id);
+            return d || { list: [] };
+          } catch (err) {
+            return { list: [] };
           }
-          if (!Array.isArray(eps)) eps = [];
-          eps.sort(function (x, y) { return (Number(x.episode_number) || 0) - (Number(y.episode_number) || 0); });
-          var parts = [];
-          for (var i = 0; i < eps.length; i++) {
-            if (!eps[i] || eps[i].id === undefined) continue;
-            var n = (eps[i].episode_number === undefined || eps[i].episode_number === null) ? (i + 1) : Math.floor(Number(eps[i].episode_number));
-            var t = String(eps[i].title || "").trim();
-            parts.push("第" + (n < 10 ? "0" + n : n) + "集" + (t ? " " + t : "") + "$" + eps[i].id);
-          }
-          var v = xfVod(a) || { vod_id: id, vod_name: id };
-          v.vod_play_from = "稀饭";
-          v.vod_play_url = parts.join("#");
-          return { list: [v] };
         });
+
+        /* 播放：三条线路各走各的 CDN，MP4 线统一过本机多路代理 */
         var xfPlay = async function (req) {
           var b = Object.assign({}, (req && req.query) || {}, body(req));
           var ep = pickEp(b, function (s) { return /^\d{1,12}$/.test(s); });
-          if (!ep) return playObj("", { ua: uaOf(req),  error: "稀饭：没有解析出播放地址（入参 " + JSON.stringify(b).slice(0, 160) + "）" });
+          if (!ep) return playObj("", { ua: uaOf(req), error: "稀饭：没有解析出剧集号" });
+
+          var flag = String(b.flag || b.from || "").trim();
+          var idx = flag.indexOf("主线-2") >= 0 ? 1 : (flag.indexOf("备用") >= 0 ? 2 : 0);
+
           var rec = null;
-          for (var attempt = 0; attempt < 2 && !rec; attempt++) {
-            try { rec = await xfIssue(ep, attempt > 0); } catch (err) { }
+          try { rec = await xfTicket(ep); } catch (e0) { rec = null; }
+          if (!rec || (!rec.mp4.length && !rec.hls)) {
+            return playObj("", { ua: uaOf(req), error: "稀饭：该集暂无可播片源" });
           }
-          if (!rec || !rec.url) return playObj("", { ua: uaOf(req), error: "稀饭：该集未取到可用播放地址" });
-          /* 注意：移动云盘终链（hydownload.pan.wo.cn）带 Referer 会直接 400，Range 也不认 */
-          var cdnH = { "User-Agent": XF_CDN_UA };
-          if (/\.m3u8(\?|#|$)/i.test(rec.url)) {
-            return playObj(rec.url, { ua: uaOf(req),  header: cdnH });
+
+          /* 备用-1：先验证 HLS 健康度，坏线自动回落主线，绝不让用户空等 */
+          if (idx === 2) {
+            var okHls = false;
+            /* 硬上限 1.2s：HLS 坏线不能拖住起播，超时直接当不可用回落主线 */
+            try {
+              okHls = await Promise.race([
+                xfHlsOk(rec, ep).catch(function () { return false; }),
+                new Promise(function (r) { setTimeout(function () { r(false); }, 1200); })
+              ]);
+            } catch (e1) { okHls = false; }
+            if (okHls) return playObj(rec.hls, { ua: uaOf(req), header: { "User-Agent": XF_CDN_UA } });
+            idx = 0;
           }
+
+          var url = rec.mp4[idx] || rec.mp4[0] || "";
+          if (!url) return playObj("", { ua: uaOf(req), error: "稀饭：主线暂无可用直链" });
+
           var it = {
-            url: rec.url, headers: cdnH, size: rec.size || 0, alts: (rec.alts || []).slice(),
-            refresh: function () {
-              return xfIssue(ep, true).then(function (nx) {
-                return (nx && nx.url) ? { url: nx.url, headers: cdnH } : null;
-              });
-            }
+            url: url,
+            headers: { "User-Agent": XF_CDN_UA },
+            size: rec.sizes[url] || 0,
+            alts: rec.mp4.filter(function (u) { return u !== url; })
           };
-          /* /play 返回时就把 302 解析掉：播放器连上来时直链已就绪，首块少等 300-600ms */
-          try { xfResolve(it); } catch (e_warm) { }
+          if (rec.finals[url]) it.final = rec.finals[url];
+          it.onFinal = function (u) { rec.finals[url] = u; };
+          it.refresh = function () {
+            return xfTicket(ep, true).then(function (nx) {
+              var u2 = (nx && (nx.mp4[idx] || nx.mp4[0])) || "";
+              return u2 ? { url: u2, headers: { "User-Agent": XF_CDN_UA } } : null;
+            });
+          };
+
+          /* 返回前先甩出 302 解析 + 首块预热，播放器连上来时直链和首块都已就绪 */
+          try { xfResolve(it); } catch (e2) { }
+          try { xfWarmHead(it); } catch (e3) { }
           var relay = xfRelayUrl(req, it);
-          return playObj(relay || rec.url, { ua: uaOf(req),  header: { "User-Agent": XF_CDN_UA } });
+          return playObj(relay || url, { ua: uaOf(req), header: { "User-Agent": XF_CDN_UA } });
         };
         e.post("/play", xfPlay);
         e.get("/play", xfPlay);
+
         e.get("/proxy/raw/:sid", function (req, reply) {
           var it = XF_ITEMS[String((req.params && req.params.sid) || "")];
           if (!it) return reply.code(404).send({ error: "not found" });
           reply.hijack();
           xfStream(req.raw, reply.raw, it);
           return reply;
-        });
-        e.post("/search", async function (req) {
-          var b = body(req);
-          var wd = String(b.wd || "").trim();
-          if (!wd) return { page: 1, list: [] };
-          var page = Number(b.page || 1);
-          var r = await xfRpc("", page, wd);
-          return { page: page, list: r.list };
         });
       }
     },
