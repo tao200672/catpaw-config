@@ -22339,11 +22339,33 @@ ${X.map(te=>te.name).join(`
     tries = tries || 3;
     var want = e - s + 1;
     function attempt(n) {
-      if (n > tries) return Promise.resolve(Buffer.alloc(0));
+      if (n > tries) {
+        /* 重试用完：换另一条 CDN 候选再试一次（不同后端对 Range 的支持不一样） */
+        var alts = (it.alts || []).filter(function (u) { return u && u !== it.url; });
+        if (!it._altSwitched && alts.length) {
+          it._altSwitched = true;
+          it.url = alts[0]; it.alts = alts.slice(1); it.final = "";
+          return attempt(1);
+        }
+        return Promise.resolve(Buffer.alloc(0));
+      }
       return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=" + s + "-" + e, "Accept-Encoding": "identity" }))
         .then(function (res) {
-          if (res.statusCode !== 200 && res.statusCode !== 206) {
-            try { res.resume(); } catch (x0) { }
+          var code = res.statusCode || 0;
+          /* ① 请求非零起点却回 200：上游忽略了 Range，读下去拿到的是文件头（moov 就找不到了） */
+          if (code === 200 && s > 0) {
+            try { res.destroy(); } catch (x0) { }
+            it.final = "";
+            if (it.refresh && n === 1) {
+              return Promise.resolve(it.refresh()).then(function (nx) {
+                if (nx && nx.url) { it.url = nx.url; it.headers = nx.headers || it.headers; }
+                return attempt(n + 1);
+              }).catch(function () { return attempt(n + 1); });
+            }
+            return attempt(n + 1);
+          }
+          if (code !== 200 && code !== 206) {
+            try { res.resume(); } catch (x1) { }
             if (it.refresh && n === 1) {
               return Promise.resolve(it.refresh()).then(function (nx) {
                 if (nx && nx.url) { it.url = nx.url; it.headers = nx.headers || it.headers; it.final = ""; }
@@ -22351,6 +22373,16 @@ ${X.map(te=>te.name).join(`
               }).catch(function () { return attempt(n + 1); });
             }
             return attempt(n + 1);
+          }
+          /* ② 206 但区间起点对不上：同样是后端返回了别段数据，丢弃重试 */
+          if (code === 206) {
+            var cr = String(res.headers["content-range"] || "");
+            var mm = /bytes\s+(\d+)-/.exec(cr);
+            if (mm && Number(mm[1]) !== s) {
+              try { res.destroy(); } catch (x2) { }
+              it.final = "";
+              return attempt(n + 1);
+            }
           }
           if (res.__url && res.__url !== it.url) {
             it.url = res.__url;
@@ -22362,11 +22394,15 @@ ${X.map(te=>te.name).join(`
             res.on("data", function (c) {
               if (done) return;
               buf.push(c); got += c.length;
-              if (got >= want) { fin(Buffer.concat(buf).slice(0, want)); try { res.resume(); } catch (x1) { } }
+              if (got >= want) { fin(Buffer.concat(buf).slice(0, want)); try { res.resume(); } catch (x3) { } }
             });
             res.on("end", function () { fin(got >= want ? Buffer.concat(buf).slice(0, want) : Buffer.alloc(0)); });
             res.on("error", function () { fin(Buffer.alloc(0)); });
-          }).then(function (b) { return b.length === want ? b : attempt(n + 1); });
+          }).then(function (b) {
+            if (b.length === want) return b;
+            /* ③ 数据不够长也当失败，绝不把半截数据拼进流里 */
+            return attempt(n + 1);
+          });
         }).catch(function () { return attempt(n + 1); });
     }
     return attempt(1);
@@ -22562,7 +22598,8 @@ ${X.map(te=>te.name).join(`
             var cand = it.cache && it.cache[s0];
             var run;
             if (cand && cand.length === want2) run = Promise.resolve(cand);
-            else if (it.headWarm && it.headWarmHS === hs && headWant === XF_RL_HEAD && it.headWarm[idx]) {
+            /* 只有从 0 开始的请求才能复用 /play 阶段的预热（预热固定抓的是文件头 0-1MB） */
+            else if (start === 0 && it.headWarm && it.headWarmHS === hs && headWant === XF_RL_HEAD && it.headWarm[idx]) {
               run = it.headWarm[idx].then(function (b) {
                 return (b && b.length === want2) ? b : xfRange(it, s0, e0, 2);
               });
