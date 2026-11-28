@@ -21951,1006 +21951,890 @@ ${X.map(te=>te.name).join(`
     }
     return "";
   }
-  /* ================= 稀饭动漫（next.xifanacg.com）· 纯 API 数据层 + 三线稳定播放 =================
-     数据：Supabase REST（api.xifanacg.com），只取展示必需字段，列表/详情/取链全部内存缓存。
-     线路：恒定三条，不随候选临时缺失而消失（这正是之前"有时候只剩备用-1"的根因）——
-           稀饭新番主线-1 = 移动云盘（apn.moedot.net 302 到 pan.wo.cn）
-           稀饭新番主线-2 = xfvod（play.xfvod.pro:8088）
-           稀饭备用-1     = HLS（dl.playxf.top），先探健康度，慢/坏就自动回落 MP4，不会空播
-     播放：MP4 走本机多路 Range 代理：首块 1MB 拆 8×128KB 渐进下发（moov 约 994KB，必须凑满
-           才能起播），之后 16 路 × 1MB 顺序拼装（实测 3.6-4.0MB/s；单连接只有 0.4-0.5MB/s）。 */
-
   var XF = {
-    base: "https://api.xifanacg.com",
-    host: "https://next.xifanacg.com",
-    key: "sb_publishable_OBIVAWACIX6lPXrO98_z24_HcsmalkA",
-    h: function () {
-      return {
-        apikey: this.key,
-        authorization: "Bearer " + this.key,
-        "x-platform": "web",
-        "x-client-info": "supabase-ssr/0.10.3 createBrowserClient",
-        "content-profile": "public",
-        Referer: this.host + "/",
-        Origin: this.host
-      };
-    }
-  };
-
-  /* 三条线路名，固定不变 */
-  var XF_L1 = "稀饭新番主线-1";
-  var XF_L2 = "稀饭新番主线-2";
-  var XF_L3 = "稀饭备用-1";
-  var XF_LINES = [XF_L1, XF_L2, XF_L3];
-
-  var XF_CATS = [
-    ["1", "连载新番", { typeId: 1, sort: "updated_at" }],
-    ["2", "完结旧番", { typeId: 2, sort: "updated_at" }],
-    ["3", "剧场版", { typeId: 3, sort: "updated_at" }],
-    ["4", "美漫", { typeId: 4, sort: "updated_at" }],
-    ["hot", "热门播放", { sort: "view_count" }],
-    ["score", "高分好评", { sort: "bangumi_score" }],
-    ["new", "最近上新", { sort: "created_at" }],
-    ["tv", "TV动画", { fmt: "tv", sort: "updated_at" }],
-    ["movie", "剧场动画", { fmt: "movie", sort: "updated_at" }],
-    ["ova", "OVA", { fmt: "ova", sort: "updated_at" }],
-    ["web", "WEB动画", { fmt: "web", sort: "updated_at" }],
-    ["fin", "已完结", { fin: true, sort: "updated_at" }],
-    ["ing", "连载中", { fin: false, sort: "updated_at" }],
-    ["y2026", "2026年", { year: 2026, sort: "updated_at" }],
-    ["y2025", "2025年", { year: 2025, sort: "updated_at" }],
-    ["y2024", "2024年", { year: 2024, sort: "updated_at" }],
-    ["y2023", "2023年", { year: 2023, sort: "updated_at" }]
-  ];
-
-  function xfCat(tid) {
-    var s = String(tid == null ? "" : tid).trim();
-    for (var i = 0; i < XF_CATS.length; i++) if (XF_CATS[i][0] === s) return XF_CATS[i];
-    return [s || "1", s || "连载新番", { typeId: 1, sort: "updated_at" }];
-  }
-
-  /* API 走 keep-alive：稀饭接口每次新建 TLS 要 300-500ms，复用连接后列表/详情能快一半 */
-  var XF_AGENT = new (require("https").Agent)({ keepAlive: true, maxSockets: 24, maxFreeSockets: 12, keepAliveMsecs: 15000 });
-  function xfApi(u, opt) {
-    opt = opt || {};
-    return new Promise(function (resolve, reject) {
-      var p;
-      try { p = new URL(u); } catch (e) { return reject(e); }
-      var lib = require("https");
-      var body = opt.body ? Buffer.from(JSON.stringify(opt.body)) : null;
-      var headers = Object.assign({}, XF.h(), { "Accept-Encoding": "gzip, deflate" }, opt.headers || {});
-      if (body) { headers["Content-Type"] = "application/json"; headers["Content-Length"] = String(body.length); }
-      var r = lib.request({
-        protocol: p.protocol, hostname: p.hostname, port: p.port || 443,
-        path: p.pathname + p.search, method: body ? "POST" : "GET",
-        headers: headers, agent: XF_AGENT, timeout: opt.timeout || 12000
-      }, function (res) {
-        var code = res.statusCode || 0;
-        if (code >= 301 && code <= 308 && res.headers.location) {
-          try { res.resume(); } catch (e0) { }
-          var nx;
-          try { nx = new URL(res.headers.location, u).toString(); } catch (e1) { return reject(e1); }
-          return resolve(xfApi(nx, opt));
-        }
-        var stream = res, enc = String(res.headers["content-encoding"] || "").toLowerCase();
-        try {
-          if (enc.indexOf("gzip") >= 0) stream = res.pipe(require("zlib").createGunzip());
-          else if (enc.indexOf("deflate") >= 0) stream = res.pipe(require("zlib").createInflate());
-        } catch (e2) { stream = res; }
-        var chunks = [];
-        stream.on("data", function (c) { chunks.push(c); });
-        stream.on("end", function () { resolve({ status: code, headers: res.headers, body: Buffer.concat(chunks).toString("utf8") }); });
-        stream.on("error", reject);
-      });
-      r.on("error", reject);
-      r.on("timeout", function () { r.destroy(new Error("timeout")); });
-      if (body) r.write(body);
-      r.end();
-    });
-  }
-
-  function xfQs(o) {
-    var p = [];
-    Object.keys(o).forEach(function (k) {
-      var v = o[k];
-      if (v === undefined || v === null || v === "") return;
-      p.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v)));
-    });
-    return p.join("&");
-  }
-
-  /* ---------- 内存缓存：列表 90s、详情 5min、取链 6min，避免来回切页重复打接口 ---------- */
-  var XF_MEM = {};
-  function xfMemGet(k) {
-    var c = XF_MEM[k];
-    if (!c) return null;
-    if (c.exp && c.exp < Date.now()) { delete XF_MEM[k]; return null; }
-    return c.v;
-  }
-  function xfMemSet(k, v, ttl) {
-    XF_MEM[k] = { v: v, exp: Date.now() + (ttl || 60000) };
-    var ks = Object.keys(XF_MEM);
-    if (ks.length > 500) ks.slice(0, 150).forEach(function (x) { delete XF_MEM[x]; });
-    return v;
-  }
-
-  function xfVod(it) {
-    if (!it) return null;
-    var id = it.id;
-    if (id === undefined || id === null || String(id) === "") return null;
-    var name = it.title || it.title_original || "";
-    var pic = String(it.cover_url || "");
-    var cur = Number(it.current_episodes || 0), tot = Number(it.total_episodes || 0);
-    var rem = "";
-    if (it.is_finished) rem = tot > 0 ? ("全" + tot + "集") : "已完结";
-    else if (cur > 0) rem = "更新至" + cur + "集" + (tot > cur ? "/" + tot : "");
-    var content = String(it.description || "").trim();
-    var tags = it.meta_tags;
-    if (tags && tags.length) content += "\n标签：" + tags.slice(0, 8).join(" / ");
-    var actors = it.actors;
-    return {
-      vod_id: String(id),
-      vod_name: String(name),
-      vod_pic: pic,
-      vod_remarks: rem,
-      vod_year: String(it.release_year || ""),
-      vod_area: String(it.region || ""),
-      vod_lang: "日语",
-      vod_score: String(it.bangumi_score || ""),
-      vod_director: String(it.director || ""),
-      vod_actor: Array.isArray(actors) ? actors.slice(0, 6).join(" / ") : "",
-      type_name: String(it.format_label || it.format || ""),
-      vod_content: content
-    };
-  }
-
-  var XF_SEL_LIST = "id,title,title_original,cover_url,current_episodes,total_episodes,is_finished,bangumi_score,release_year,region,format,updated_at";
-  var XF_SEL_DETAIL = "id,title,title_original,cover_url,description,release_year,region,director,actors,current_episodes,total_episodes,is_finished,bangumi_score,meta_tags,format,episodes(id,episode_number,title,kind)";
-
-  /* 列表：REST 直查（比 rpc/search_animes 少 60% 体积），total 从 content-range 取 */
-  async function xfList(tid, page, wd) {
-    page = Number(page) > 0 ? Math.floor(Number(page)) : 1;
-    var key = "L:" + tid + ":" + page + ":" + (wd || "");
-    var hit = xfMemGet(key);
-    if (hit) return hit;
-
-    var c = xfCat(tid)[2];
-    var limit = 24;
-    var q = { select: XF_SEL_LIST, limit: String(limit), offset: String((page - 1) * limit) };
-    if (wd) {
-      var w = String(wd).trim().replace(/[(),*]/g, " ");
-      q.or = "(title.ilike.*" + w + "*,search_title.ilike.*" + w + "*)";
-    } else {
-      q.is_published = "eq.true";
-      if (c.typeId) q.type_id = "eq." + c.typeId;
-      if (c.fmt) q.format = "eq." + c.fmt;
-      if (c.fin !== undefined) q.is_finished = "eq." + c.fin;
-      if (c.year) q.release_year = "eq." + c.year;
-    }
-    q.order = (c.sort || "updated_at") + ".desc";
-
-    var r = await xfApi(XF.base + "/rest/v1/animes?" + xfQs(q), { headers: { Prefer: "count=exact" }, timeout: 15000 });
-    var arr = js(r.body);
-    var list = [];
-    if (Array.isArray(arr)) {
-      for (var i = 0; i < arr.length; i++) { var v = xfVod(arr[i]); if (v) list.push(v); }
-    }
-    var total = list.length;
-    var cr = String((r.headers && r.headers["content-range"]) || "");
-    var m = /\/(\d+)\s*$/.exec(cr);
-    if (m) total = Number(m[1]) || total;
-    var out = { list: list, total: total, page: page, pagecount: Math.max(1, Math.ceil(total / limit)), limit: limit };
-    return xfMemSet(key, out, 90 * 1000);
-  }
-
-  /* 首页：三段并行拉（连载新番 / 最近上新 / 高口碑），去重后给 24 条 */
-  async function xfHome() {
-    var hit = xfMemGet("HOME");
-    if (hit) return hit;
-    var jobs = [
-      xfList("1", 1, "").catch(function () { return { list: [] }; }),
-      xfList("new", 1, "").catch(function () { return { list: [] }; }),
-      xfList("score", 1, "").catch(function () { return { list: [] }; })
-    ];
-    var rs = await Promise.all(jobs);
-    var seen = {}, list = [];
-    rs.forEach(function (r) {
-      (r.list || []).forEach(function (v) {
-        if (!v || seen[v.vod_id]) return;
-        seen[v.vod_id] = 1;
-        list.push(v);
-      });
-    });
-    var out = {
-      "class": XF_CATS.map(function (c2) { return { type_id: c2[0], type_name: c2[1] }; }),
-      filters: {},
-      list: list.slice(0, 24)
-    };
-    return xfMemSet("HOME", out, 90 * 1000);
-  }
-
-  /* 详情：一条请求带出剧集（嵌套 episodes），比"详情+剧集"两次往返快一倍 */
-  async function xfDetail(id) {
-    id = String(id || "").trim();
-    if (!id) return null;
-    var key = "D:" + id;
-    var hit = xfMemGet(key);
-    if (hit) return hit;
-
-    var r = await xfApi(XF.base + "/rest/v1/animes?" + xfQs({ id: "eq." + id, select: XF_SEL_DETAIL, limit: "1" }), { timeout: 15000 });
-    var arr = js(r.body);
-    var a = (Array.isArray(arr) && arr[0]) ? arr[0] : null;
-    if (!a) return null;                       /* 不存在的 id：直接返回空，不造假条目 */
-    var eps = Array.isArray(a.episodes) ? a.episodes : [];
-    if (!eps.length) {
-      var r2 = await xfApi(XF.base + "/rest/v1/episodes?" + xfQs({ anime_id: "eq." + id, select: "id,episode_number,title,kind", order: "episode_number.asc", limit: "3000" }), { timeout: 15000 });
-      var e2 = js(r2.body);
-      if (Array.isArray(e2)) eps = e2;
-    }
-    eps = eps.filter(function (x) { return x && x.id !== undefined && x.id !== null; });
-    eps.sort(function (x, y) { return (Number(x.episode_number) || 0) - (Number(y.episode_number) || 0); });
-
-    var parts = [];
-    for (var i = 0; i < eps.length; i++) {
-      var n = (eps[i].episode_number === undefined || eps[i].episode_number === null) ? (i + 1) : Math.floor(Number(eps[i].episode_number));
-      var t = String(eps[i].title || "").trim();
-      parts.push("第" + (n < 10 ? "0" + n : n) + "集" + (t ? " " + t : "") + "$" + eps[i].id);
-    }
-
-    var v = xfVod(a) || { vod_id: id, vod_name: id };
-    /* 三条线路恒定输出，播放地址用同一份剧集表 —— 候选哪天缺一条也不会让线路消失 */
-    var epsStr = parts.join("#");
-    v.vod_play_from = XF_LINES.join("$$$");
-    v.vod_play_url = [epsStr, epsStr, epsStr].join("$$$");
-    if (parts.length) v.vod_remarks = (v.vod_remarks ? v.vod_remarks + " · " : "") + "3线";
-    var out = { list: [v] };
-
-    /* 后台预热：第一集的播放票据 + HLS 健康度，用户点播放时基本零等待 */
-    if (eps.length) {
-      var ep0 = String(eps[0].id);
-      setTimeout(function () {
-        try { xfTicket(ep0).catch(function () { }); } catch (e0) { }
-      }, 0);
-    }
-    return xfMemSet(key, out, 5 * 60 * 1000);
-  }
-
-  /* ---------- 播放票据：按集缓存，含所有 MP4 候选 + HLS，供三条线路各取所需 ---------- */
-  var XF_TICKET = {};
-  function xfTicket(ep, force) {
-    var k = String(ep), now = Date.now(), c = XF_TICKET[k];
-    if (!force && c && (now - c.at) < 6 * 60 * 1000 && (!c.exp || c.exp * 1000 > now + 120000)) return Promise.resolve(c);
-    return xfApi(XF.base + "/functions/v1/issue-web-playback", { body: { action: "fallback", episode_id: Number(ep) }, timeout: 15000 }).then(function (r) {
-      var j = js(r.body) || {};
-      var main = j.url ? String(j.url) : "";
-      var mp4 = [], hls = "", sizes = {};
-      (j.candidates || []).forEach(function (x) {
-        var u = (x && x.url) ? String(x.url) : "";
-        if (!u) return;
-        sizes[u] = Number(x.expected_bytes || 0) || 0;
-        if (/\.m3u8(\?|#|$)/i.test(u)) { if (!hls) hls = u; return; }
-        if (mp4.indexOf(u) < 0) mp4.push(u);
-      });
-      if (main) {
-        if (/\.m3u8(\?|#|$)/i.test(main)) { if (!hls) hls = main; }
-        else if (mp4.indexOf(main) < 0) mp4.unshift(main);
-      }
-      var rec = { mp4: mp4, hls: hls, sizes: sizes, finals: {}, exp: Number(j.expires_at || 0) || 0, at: now };
-      if (mp4.length || hls) XF_TICKET[k] = rec;
-      var ks = Object.keys(XF_TICKET);
-      if (ks.length > 300) ks.slice(0, 100).forEach(function (x) { delete XF_TICKET[x]; });
-      return rec;
-    }).catch(function () { return null; });
-  }
-
-  /* ---------- HLS 健康度：dl.playxf.top 实测只有 56-300KB/s 且偶发 ECONNRESET，
-     所以备用线必须先验证"能拿且不慢"，不达标直接回落 MP4，避免用户点进去空转 ---------- */
-  var XF_HLSV = {};
-  function xfCollect(res, cap, timeoutMs) {
-    return new Promise(function (resolve) {
-      var buf = [], n = 0, done = false;
-      function fin() {
-        if (done) return; done = true;
-        var b = Buffer.concat(buf);
-        resolve({ n: n, buf: b, text: b.toString("utf8") });
-      }
-      res.on("data", function (c) {
-        if (done) return;
-        n += c.length; buf.push(c);
-        if (cap && n >= cap) { fin(); try { res.destroy(); } catch (e0) { } }
-      });
-      res.on("end", fin);
-      res.on("error", fin);
-      if (timeoutMs) setTimeout(fin, timeoutMs);
-    });
-  }
-
-  async function xfHlsOk(rec, ep) {
-    var k = String(ep), c = XF_HLSV[k];
-    if (c && (Date.now() - c.at) < 10 * 60 * 1000) return c.ok;
-    var ok = false;
-    if (!rec || !rec.hls) {
-      XF_HLSV[k] = { ok: false, at: Date.now() };
-      return false;
-    }
-    try {
-      var r1 = await xfHttpGet(rec.hls, { "User-Agent": XF_CDN_UA }, 1200);
-      if (r1.statusCode === 200) {
-        var t1 = await xfCollect(r1, 96 * 1024, 900);
-        var segs = String(t1.text || "").split("\n").map(function (s) { return s.trim(); })
-          .filter(function (l) { return l && l.charAt(0) !== "#"; });
-        if (segs.length) {
-          var seg = segs[0];
-          try { seg = new URL(seg, rec.hls).toString(); } catch (e1) { }
-          var t0 = Date.now();
-          var r2 = await xfHttpGet(seg, { "User-Agent": XF_CDN_UA, Range: "bytes=0-131071", "Accept-Encoding": "identity" }, 1000);
-          if (r2.statusCode === 200 || r2.statusCode === 206) {
-            var got = await xfCollect(r2, 131072, 1000);
-            var secs = Math.max(0.25, (Date.now() - t0) / 1000);
-            var kbs = got.n / 1024 / secs;
-            ok = got.n >= 65536 && kbs >= 500;
-          }
-        }
-      }
-    } catch (e2) { ok = false; }
-    XF_HLSV[k] = { ok: ok, at: Date.now() };
-    return ok;
-  }
-
-  /* 播放响应包装：CatPaw 客户端会把 url 和 playUrl 拼接使用（url + playUrl），
-     playUrl 必须留空 —— 官方站（影探4K / 盘搜）返回的都是 playUrl:""，
-     否则本地代理地址会被拼成 ".../proxy/raw/<sid>http://..." 直接 404。 */
-  function xfOut(u, ua) {
-    var o = playObj(u, { ua: ua, header: { "User-Agent": XF_CDN_UA } });
-    if (o && typeof o === "object") o.playUrl = "";
-    return o;
-  }
-
-  /* ======================== 多路 Range 代理 ======================== */
-  var XF_CDN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-  /* 实测：该 CDN 单连接 0.3-2MB/s 且波动大；首块 8×128KB 并行能把 moov(994KB) 压到 1-1.5s，
-       之后 16 路×1MB 拉满（裸测 16 路聚合 2.7-4.8MB/s）。首块期间不预取，避免抢带宽拖慢起播。 */
-  var XF_RL_W = 16, XF_RL_CHUNK = 1 << 20, XF_RL_HEAD = 1 << 20, XF_RL_HW = 8, XF_RL_PREFILL = 0, XF_RL_CACHE = 32 << 20;
-  var XF_ITEMS = {}, XF_SEQ = 0;
-
-  /* 跟随 3xx：稀饭主链 302 到移动云盘，不跟随就会把 302 当失败 */
-  function xfHttpGet(u, headers, timeout, depth) {
-    depth = depth || 0;
-    return new Promise(function (resolve, reject) {
-      var p;
-      try { p = new URL(u); } catch (e) { return reject(e); }
-      var lib = p.protocol === "http:" ? require("http") : require("https");
-      var r = lib.request({
-        protocol: p.protocol, hostname: p.hostname, port: p.port || (p.protocol === "http:" ? 80 : 443),
-        path: p.pathname + p.search, method: "GET", headers: headers || {}, timeout: timeout || 30000
-      }, function (res) {
-        var code = res.statusCode || 0;
-        if (code === 301 || code === 302 || code === 303 || code === 307 || code === 308) {
-          var loc = res.headers && res.headers.location;
-          try { res.resume(); } catch (e0) { }
-          if (loc && depth < 5) {
-            var next;
-            try { next = new URL(loc, u).toString(); } catch (e1) { return reject(e1); }
-            return resolve(xfHttpGet(next, headers, timeout, depth + 1));
-          }
-          return reject(new Error("redirect " + code));
-        }
-        res.__url = u;
-        resolve(res);
-      });
-      r.on("error", reject);
-      r.on("timeout", function () { r.destroy(new Error("timeout")); });
-      r.end();
-    });
-  }
-
-  function xfRange(it, s, e, tries) {
-    tries = tries || 3;
-    var want = e - s + 1;
-    function attempt(n) {
-      if (n > tries) {
-        /* 重试用完：换另一条 CDN 候选再试一次（不同后端对 Range 的支持不一样） */
-        var alts = (it.alts || []).filter(function (u) { return u && u !== it.url; });
-        if (!it._altSwitched && alts.length) {
-          it._altSwitched = true;
-          it.url = alts[0]; it.alts = alts.slice(1); it.final = "";
-          return attempt(1);
-        }
-        return Promise.resolve(Buffer.alloc(0));
-      }
-      return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=" + s + "-" + e, "Accept-Encoding": "identity" }))
-        .then(function (res) {
-          var code = res.statusCode || 0;
-          /* ① 请求非零起点却回 200：上游忽略了 Range，读下去拿到的是文件头（moov 就找不到了） */
-          if (code === 200 && s > 0) {
-            try { res.destroy(); } catch (x0) { }
-            it.final = "";
-            if (it.refresh && n === 1) {
-              return Promise.resolve(it.refresh()).then(function (nx) {
-                if (nx && nx.url) { it.url = nx.url; it.headers = nx.headers || it.headers; }
-                return attempt(n + 1);
-              }).catch(function () { return attempt(n + 1); });
-            }
-            return attempt(n + 1);
-          }
-          if (code !== 200 && code !== 206) {
-            try { res.resume(); } catch (x1) { }
-            if (it.refresh && n === 1) {
-              return Promise.resolve(it.refresh()).then(function (nx) {
-                if (nx && nx.url) { it.url = nx.url; it.headers = nx.headers || it.headers; it.final = ""; }
-                return attempt(n + 1);
-              }).catch(function () { return attempt(n + 1); });
-            }
-            return attempt(n + 1);
-          }
-          /* ② 206 但区间起点对不上：同样是后端返回了别段数据，丢弃重试 */
-          if (code === 206) {
-            var cr = String(res.headers["content-range"] || "");
-            var mm = /bytes\s+(\d+)-/.exec(cr);
-            if (mm && Number(mm[1]) !== s) {
-              try { res.destroy(); } catch (x2) { }
-              it.final = "";
-              return attempt(n + 1);
-            }
-          }
-          if (res.__url && res.__url !== it.url) {
-            it.url = res.__url;
-            if (it.onFinal) { try { it.onFinal(res.__url); } catch (e_f) { } }
-          }
-          return new Promise(function (resolve) {
-            var buf = [], got = 0, done = false;
-            function fin(b) { if (!done) { done = true; resolve(b); } }
-            res.on("data", function (c) {
-              if (done) return;
-              buf.push(c); got += c.length;
-              if (got >= want) { fin(Buffer.concat(buf).slice(0, want)); try { res.resume(); } catch (x3) { } }
-            });
-            res.on("end", function () { fin(got >= want ? Buffer.concat(buf).slice(0, want) : Buffer.alloc(0)); });
-            res.on("error", function () { fin(Buffer.alloc(0)); });
-          }).then(function (b) {
-            if (b.length === want) return b;
-            /* ③ 数据不够长也当失败，绝不把半截数据拼进流里 */
-            return attempt(n + 1);
-          });
-        }).catch(function () { return attempt(n + 1); });
-    }
-    return attempt(1);
-  }
-
-  function xfSize(it) {
-    if (it.size) return Promise.resolve(it.size);
-    return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=0-0", "Accept-Encoding": "identity" }), 12000).then(function (res) {
-      var m = /\/(\d+)\s*$/.exec(String(res.headers["content-range"] || ""));
-      if (res.__url && res.__url !== it.url) it.url = res.__url;
-      try { res.resume(); } catch (x) { }
-      if (m) it.size = Number(m[1]);
-      return it.size || 0;
-    }).catch(function () { return 0; });
-  }
-
-  /* 解析 302 一次并缓存：播放器连上来时直链已就绪，省掉每块一次跳转 */
-  function xfResolve(it) {
-    if (it.final) return Promise.resolve(it.final);
-    if (it.resolving) return it.resolving;
-    it.resolving = xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=0-1", "Accept-Encoding": "identity" }), 10000).then(function (res) {
-      var m = /\/(\d+)\s*$/.exec(String(res.headers["content-range"] || ""));
-      if (m) it.size = Number(m[1]) || it.size;
-      if (res.__url) {
-        it.final = res.__url; it.url = res.__url;
-        if (it.onFinal) { try { it.onFinal(res.__url); } catch (e0) { } }
-      }
-      try { res.destroy(); } catch (e1) { }
-      it.resolving = null;
-      return it.final || it.url;
-    }).catch(function () { it.resolving = null; return it.url; });
-    return it.resolving;
-  }
-
-  /* 兜底：单连接直推（多路被 CDN 拒时仍能播，不会干等） */
-  function xfPipeDirect(it, res, start, end) {
-    return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=" + start + "-" + end, "Accept-Encoding": "identity" }), 30000).then(function (r) {
-      var skip = (r.statusCode === 200 && start > 0) ? start : 0;
-      var pos = start;
-      r.on("data", function (c) {
-        var buf = c;
-        if (skip > 0) {
-          if (c.length <= skip) { skip -= c.length; return; }
-          buf = c.slice(skip); skip = 0;
-        }
-        if (pos + buf.length > end + 1) buf = buf.slice(0, end + 1 - pos);
-        if (!buf.length) return;
-        pos += buf.length;
-        try { res.write(buf); } catch (e0) { }
-        if (pos > end) { try { r.destroy(); } catch (e1) { } try { res.end(); } catch (e2) { } }
-      });
-      r.on("end", function () { try { res.end(); } catch (e) { } });
-      r.on("error", function () { try { res.end(); } catch (e) { } });
-    }).catch(function () { try { res.end(); } catch (e) { } });
-  }
-
-  /* /play 阶段就把首块 1MB 拆 8 片开始抓：播放器通常 100-300ms 后才连上来，
-     那时缓存里已有货，起播少等 0.3-0.6s。 */
-  function xfWarmHead(it) {
-    if (it.headWarm) return;
-    var hs = Math.ceil(XF_RL_HEAD / XF_RL_HW);
-    it.headWarmHS = hs;
-    it.headWarm = [];
-    for (var i = 0; i < XF_RL_HW; i++) {
-      (function (idx, s0) {
-        var hit = it.cache && it.cache[s0];
-        if (hit && hit.length === hs) { it.headWarm[idx] = Promise.resolve(hit); return; }
-        it.headWarm[idx] = xfRange(it, s0, s0 + hs - 1, 1).then(function (b) {
-          if (b && b.length === hs) xfCachePut(it, s0, b);
-          return b;
-        }).catch(function () { return null; });
-      })(i, i * hs);
-    }
-  }
-
-  function xfCachePut(it, p, buf) {
-    if (!it.cache) { it.cache = {}; it.cacheBytes = 0; }
-    if (!buf || !buf.length || it.cache[p]) return;
-    it.cache[p] = buf; it.cacheBytes += buf.length;
-    while (it.cacheBytes > XF_RL_CACHE) {
-      var ks = Object.keys(it.cache);
-      if (!ks.length) break;
-      it.cacheBytes -= it.cache[ks[0]].length;
-      delete it.cache[ks[0]];
-    }
-  }
-
-  function xfStream(req, res, it) {
-    var closed = false;
-    res.on("close", function () { closed = true; });
-    try { xfResolve(it); } catch (e_r) { }
-    xfSize(it).then(function (total) {
-      if (!total || total <= 0) { res.statusCode = 502; return res.end(); }
-      var hdr = (req.headers && req.headers.range) || "";
-      var start = 0, end = total - 1, m = /bytes=(\d*)-(\d*)/.exec(hdr);
-      if (m) {
-        if (m[1] === "" && m[2]) start = Math.max(0, total - Number(m[2]));
-        else { start = Number(m[1] || 0); end = m[2] ? Number(m[2]) : total - 1; }
-      }
-      if (start >= total) { res.statusCode = 416; res.setHeader("Content-Range", "bytes */" + total); return res.end(); }
-      if (end >= total) end = total - 1;
-      res.statusCode = hdr ? 206 : 200;
-      res.setHeader("Content-Type", "video/mp4");
-      res.setHeader("Accept-Ranges", "bytes");
-      res.setHeader("Content-Length", String(end - start + 1));
-      if (hdr) res.setHeader("Content-Range", "bytes " + start + "-" + end + "/" + total);
-      res.setHeader("Cache-Control", "no-store");
-      res.setHeader("Connection", "close");
-      if (req.method === "HEAD") return res.end();
-
-      var pending = {}, order = [], nextPos = start, outPos = start, retryN = {};
-      function submit(p) {
-        var sz = Math.min(XF_RL_CHUNK, end - p + 1), b = p + sz - 1;
-        var hit = it.cache && it.cache[p];
-        if (hit && hit.length === b - p + 1) { pending[p] = Promise.resolve(hit); return b + 1; }
-        pending[p] = xfRange(it, p, b, 3).then(function (x) { xfCachePut(it, p, x); return x; });
-        return b + 1;
-      }
-      function pump() {
-        if (closed) return;
-        var p = order.shift();
-        if (p === undefined) return;
-        var pr = pending[p];
-        if (!pr) return res.end();
-        pr.then(function (buf) {
-          delete pending[p];
-          if (closed) return;
-          if (!buf || !buf.length) {
-            var n = (retryN[p] || 0) + 1;
-            if (n <= 3) {
-              retryN[p] = n; order.unshift(p);
-              var sz2 = Math.min(XF_RL_CHUNK, end - p + 1);
-              pending[p] = xfRange(it, p, p + sz2 - 1, 3).then(function (x) { xfCachePut(it, p, x); return x; });
-              return setTimeout(pump, 150 * n);
-            }
-            return res.end();
-          }
-          res.write(buf, function () {
-            if (closed) return;
-            outPos += buf.length;
-            if (nextPos <= end) { order.push(nextPos); nextPos = submit(nextPos); }
-            if (outPos > end) return res.end();
-            pump();
-          });
-        }).catch(function () { try { res.end(); } catch (x) { } });
-      }
-
-      /* 首块（moov 约 994KB）单连接流式直写：字节到多少发多少，不等凑满；
-         同时把后面 16×1MB 的窗口全部预取。首字节 ~0.3-0.6s，moov ~1.2-1.5s。 */
-      var headWant = Math.min(XF_RL_HEAD, end - start + 1);
-      var winStart = Math.min(start + headWant, end + 1);
-      var preQueued = [], prefilled = false, winStarted = false, headTried = false;
-
-      function prefill() {
-        if (prefilled) return;
-        prefilled = true;
-        var p2 = winStart, k = 0;
-        while (p2 <= end && k < XF_RL_PREFILL) { preQueued.push(p2); p2 = submit(p2); k++; }
-        nextPos = p2;
-      }
-      function startWindow() {
-        if (winStarted) return;
-        winStarted = true;
-        if (outPos !== winStart) {
-          /* 首块没写满：从断点继续，丢弃预取，保证不出现空洞 */
-          pending = {}; preQueued = []; prefilled = true; nextPos = outPos;
-          while (nextPos <= end && order.length < XF_RL_W) { order.push(nextPos); nextPos = submit(nextPos); }
-          return pump();
-        }
-        if (!prefilled) prefill();
-        for (var qi = 0; qi < preQueued.length; qi++) order.push(preQueued[qi]);
-        preQueued = [];
-        /* 首块已落地，把并发拉满到 16 路 */
-        while (nextPos <= end && order.length < XF_RL_W) { order.push(nextPos); nextPos = submit(nextPos); }
-        pump();
-      }
-
-      function headStream() {
-        var hs = Math.ceil(headWant / XF_RL_HW);
-        var sliceN = Math.min(XF_RL_HW, Math.ceil(headWant / hs));
-        var slices = new Array(sliceN), wi0 = 0, done0 = 0;
-        function flush() {
-          while (wi0 < sliceN && slices[wi0] && slices[wi0].length) {
-            var b = slices[wi0]; slices[wi0] = null; wi0++;
-            outPos += b.length;
-            if (!closed) { try { res.write(b); } catch (e0) { } }
-          }
-        }
-        for (var hi = 0; hi < sliceN; hi++) {
-          (function (idx) {
-            var s0 = start + idx * hs, e0 = Math.min(s0 + hs - 1, start + headWant - 1);
-            var want2 = e0 - s0 + 1;
-            var cand = it.cache && it.cache[s0];
-            var run;
-            if (cand && cand.length === want2) run = Promise.resolve(cand);
-            /* 只有从 0 开始的请求才能复用 /play 阶段的预热（预热固定抓的是文件头 0-1MB） */
-            else if (start === 0 && it.headWarm && it.headWarmHS === hs && headWant === XF_RL_HEAD && it.headWarm[idx]) {
-              run = it.headWarm[idx].then(function (b) {
-                return (b && b.length === want2) ? b : xfRange(it, s0, e0, 2);
-              });
-            } else run = xfRange(it, s0, e0, 2);
-            run.then(function (b) {
-              slices[idx] = b || Buffer.alloc(0);
-            }).catch(function () {
-              slices[idx] = Buffer.alloc(0);
-            }).then(function () {
-              flush();
-              done0++;
-              if (closed) return;
-              if (done0 >= sliceN) startWindow();
-            });
-          })(hi);
-        }
-      }
-      function headAlt() {
-        if (closed) return;
-        var alts = (it.alts || []).filter(function (u) { return u && u !== it.url; });
-        if (!headTried && alts.length) {
-          headTried = true;
-          it.url = alts[0]; it.final = ""; it.alts = alts.slice(1);
-          pending = {}; order = []; preQueued = []; prefilled = false;
-          return headStream();
-        }
-        xfPipeDirect(it, res, start, end);
-      }
-
-      prefill();
-      headStream();
-    }).catch(function () { try { res.statusCode = 502; res.end(); } catch (x) { } });
-  }
-
-  function xfRelayUrl(req, it) {
-    XF_SEQ++;
-    var sid = ((Date.now() % 100000) * 1000 + (XF_SEQ % 1000)).toString(36);
-    XF_ITEMS[sid] = it;
-    var ks = Object.keys(XF_ITEMS);
-    if (ks.length > 24) ks.slice(0, ks.length - 24).forEach(function (k) { delete XF_ITEMS[k]; });
-    var host = (req && req.headers && (req.headers.host || req.headers.Host)) || "";
-    if (!host) return "";
-    var root = /^https?:\/\//i.test(host) ? host : "http://" + host;
-    return root + "/spider/xifan/3/proxy/raw/" + sid;
-  }
-  /* ================= GiriGiri爱（ani.girigirilove.com）· 纯 API =================
-     数据接口就是官网 SPA 自己用的那套：
-       https://m3u8.girigirilove.com/api.php/Vod/get_list
-         offset / limit / type_id / orderby / vod_class / vod_lang / vod_version / vod_state / vod_name
-         → { code:1, info:{ total, offset, limit, rows:[{vod_id,vod_name,vod_pic,vod_remarks,...}] } }
-       https://m3u8.girigirilove.com/api.php/Vod/get_detail?vod_id=
-         → info.vod_play_url 里**直接带每集 m3u8 直链**（旧版要再抓一次播放页，现在全省了）
-       https://m3u8.girigirilove.com/api.php/Vod/getAllTagOption  → 筛选项
-     播放：把 m3u8 落成本地播放列表 /proxy/pl/<sid>.m3u8（命中缓存基本 0ms），
-           分片由播放器直连 CDN —— 实测分片不需要任何请求头，顺序播放 1.1-1.4MB/s。 */
-
-  var GG = {
-    api: "https://m3u8.girigirilove.com/api.php",
-    host: "https://ani.girigirilove.com",
-    img: "https://jpg.girigirilove.com"
-  };
-  var GG_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-  var GG_AGENT = new (require("https").Agent)({ keepAlive: true, maxSockets: 20, maxFreeSockets: 10, keepAliveMsecs: 15000 });
-  var GG_MEM = {}, GG_PL = {}, GG_SID = {}, GG_SEQ = 0;
-  var GG_LINE = "🌸 GiriGiri";
-
-  var GG_CATS = [
-    ["2", "日漫·连载", { typeId: "2" }],
-    ["21", "劇場版", { typeId: "21" }],
-    ["3", "欧美动漫", { typeId: "3" }],
-    ["20", "真人番剧", { typeId: "20" }],
-    ["hot", "热门播放", { orderby: "hits" }],
-    ["score", "高分好评", { orderby: "score" }]
-  ];
-
-  function ggCat(tid) {
-    var s = String(tid == null ? "" : tid).trim();
-    for (var i = 0; i < GG_CATS.length; i++) if (GG_CATS[i][0] === s) return GG_CATS[i];
-    return GG_CATS[0];
-  }
-
-  function ggQs(o) {
-    var p = [];
-    Object.keys(o).forEach(function (k) {
-      var v = o[k];
-      if (v === undefined || v === null || v === "") return;
-      p.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v)));
-    });
-    return p.join("&");
-  }
-
-  function ggMemGet(k) {
-    var c = GG_MEM[k];
-    if (!c) return null;
-    if (c.exp && c.exp < Date.now()) { delete GG_MEM[k]; return null; }
-    return c.v;
-  }
-  function ggMemSet(k, v, ttl) {
-    GG_MEM[k] = { v: v, exp: Date.now() + (ttl || 60000) };
-    var ks = Object.keys(GG_MEM);
-    if (ks.length > 400) ks.slice(0, 120).forEach(function (x) { delete GG_MEM[x]; });
-    return v;
-  }
-
-  /* 接口请求：keep-alive + gzip，比每次新建 TLS 快 300-500ms */
-  function ggApi(path, q) {
-    var url = GG.api + path + (q && Object.keys(q).length ? ("?" + ggQs(q)) : "");
-    return new Promise(function (resolve, reject) {
-      var p;
-      try { p = new URL(url); } catch (e) { return reject(e); }
-      var r = require("https").request({
-        protocol: p.protocol, hostname: p.hostname, port: p.port || 443,
-        path: p.pathname + p.search, method: "GET",
-        headers: {
-          "User-Agent": GG_UA, Accept: "application/json", Referer: GG.host + "/",
-          "Accept-Encoding": "gzip, deflate"
-        },
-        agent: GG_AGENT, timeout: 12000
-      }, function (res) {
-        var stream = res, enc = String(res.headers["content-encoding"] || "").toLowerCase();
-        try {
-          if (enc.indexOf("gzip") >= 0) stream = res.pipe(require("zlib").createGunzip());
-          else if (enc.indexOf("deflate") >= 0) stream = res.pipe(require("zlib").createInflate());
-        } catch (e0) { stream = res; }
-        var chunks = [];
-        stream.on("data", function (c) { chunks.push(c); });
-        stream.on("end", function () {
-          var txt = Buffer.concat(chunks).toString("utf8");
-          var j = null;
-          try { j = JSON.parse(txt); } catch (e1) { j = null; }
-          if (!j) return reject(new Error("接口返回非 JSON"));
-          if (Number(j.code) !== 1 && j.code !== undefined) return reject(new Error(j.msg || ("code " + j.code)));
-          resolve(j.info === undefined ? j : j.info);
-        });
-        stream.on("error", reject);
-      });
-      r.on("error", reject);
-      r.on("timeout", function () { r.destroy(new Error("timeout")); });
-      r.end();
-    });
-  }
-
-  function ggPic(p) {
-    var s = String(p == null ? "" : p).trim();
-    if (!s) return "";
-    if (s.indexOf("//") === 0) return "https:" + s;
-    if (/^https?:/i.test(s)) return s;
-    return GG.img + (s.charAt(0) === "/" ? s : "/" + s);
-  }
-
-  function ggVod(it) {
-    if (!it) return null;
-    var id = it.vod_id;
-    if (id === undefined || id === null || String(id) === "") return null;
-    return {
-      vod_id: String(id),
-      vod_name: String(it.vod_name || "").trim(),
-      vod_pic: ggPic(it.vod_pic),
-      vod_remarks: String(it.vod_remarks || "").replace(/\s*\/\s*0點0分\s*$/, "").trim(),
-      vod_year: String(it.vod_year || ""),
-      vod_area: String(it.vod_area || ""),
-      vod_score: String(it.vod_score || ""),
-      vod_actor: String(it.vod_actor || "").slice(0, 120),
-      vod_director: String(it.vod_director || ""),
-      vod_content: String(it.vod_blurb || it.vod_content || "").trim()
-    };
-  }
-
-  async function ggList(tid, page, wd, flt) {
-    page = Number(page) > 0 ? Math.floor(Number(page)) : 1;
-    flt = flt || {};
-    var ck = "G:" + tid + ":" + page + ":" + (wd || "") + ":" + JSON.stringify(flt);
-    var hit = ggMemGet(ck);
-    if (hit) return hit;
-
-    var c = ggCat(tid)[2] || {};
-    var limit = 24;
-    var q = { offset: String((page - 1) * limit), limit: String(limit) };
-    if (c.typeId) q.type_id = c.typeId;
-    if (c.orderby) q.orderby = c.orderby;
-    if (wd) q.vod_name = String(wd).trim();
-    if (flt["class"]) q.vod_class = flt["class"];
-    if (flt.lang) q.vod_lang = flt.lang;
-    if (flt.ver) q.vod_version = flt.ver;
-    if (flt.state) q.vod_state = flt.state;
-    if (flt.order) q.orderby = flt.order;
-
-    var info = await ggApi("/Vod/get_list", q);
-    var rows = (info && info.rows) || [];
-    var list = [];
-    for (var i = 0; i < rows.length; i++) { var v = ggVod(rows[i]); if (v) list.push(v); }
-    var total = Number(info && info.total) || list.length;
-    var out = { list: list, total: total, page: page, limit: limit, pagecount: Math.max(1, Math.ceil(total / limit)) };
-    return ggMemSet(ck, out, 90 * 1000);
-  }
-
-  /* 详情：一次请求拿到全部剧集 + 每集 m3u8 直链 */
-  async function ggDetail(id) {
-    id = String(id || "").trim();
-    if (!id) return null;
-    var ck = "GD:" + id;
-    var hit = ggMemGet(ck);
-    if (hit) return hit;
-
-    var info = await ggApi("/Vod/get_detail", { vod_id: id });
-    if (!info || !info.vod_id) return null;
-
-    var froms = String(info.vod_play_from || "").split("$$$");
-    var groups = String(info.vod_play_url || "").split("$$$");
-    var v = ggVod(info) || { vod_id: id, vod_name: id };
-    v.vod_content = String(info.vod_blurb || info.vod_content || "").trim();
-    if (info.vod_pubdate) v.vod_pubdate = String(info.vod_pubdate);
-
-    var lines = [], urls = [], epsFirst = "";
-    for (var g = 0; g < groups.length; g++) {
-      var items = String(groups[g] || "").split("#").filter(function (x) { return x && x.indexOf("$") > 0; });
-      if (!items.length) continue;
-      var parts = [];
-      for (var i = 0; i < items.length; i++) {
-        var k = items[i].lastIndexOf("$");
-        var nm = items[i].slice(0, k).trim();
-        var u = items[i].slice(k + 1).trim();
-        if (!/^https?:\/\//i.test(u)) continue;
-        var label = /^\d+$/.test(nm) ? ("第" + (nm.length < 2 ? "0" + nm : nm) + "集") : (nm || ("第" + (i + 1) + "集"));
-        parts.push(label + "$" + u);
-      }
-      if (!parts.length) continue;
-      lines.push(GG_LINE + (groups.length > 1 ? ("-" + (g + 1)) : ""));
-      urls.push(parts.join("#"));
-      if (!epsFirst) epsFirst = parts[0].split("$").slice(1).join("$");
-    }
-    if (!lines.length) return null;
-
-    v.vod_play_from = lines.join("$$$");
-    v.vod_play_url = urls.join("$$$");
-    if (v.vod_remarks) v.vod_remarks += " · " + lines.length + "线";
-
-    /* 预热前几集的播放列表：用户点开就基本 0 等待（串行并发 2，避免一次打太多请求） */
-    var warm = [];
-    String(urls[0] || "").split("#").slice(0, 3).forEach(function (x) {
-      var k = x.lastIndexOf("$");
-      if (k > 0 && /^https?:\/\//i.test(x.slice(k + 1))) warm.push(x.slice(k + 1));
-    });
-    if (warm.length) {
-      setTimeout(function () {
-        var i = 0;
-        (function next() {
-          if (i >= warm.length) return;
-          var u = warm[i++];
-          try { ggPlLoad(u).then(function () { next(); }).catch(function () { next(); }); } catch (e0) { next(); }
-        })();
-      }, 0);
-    }
-
-    return ggMemSet(ck, { list: [v] }, 5 * 60 * 1000);
-  }
-
-  /* 播放列表：缓存 + 把相对分片改写成绝对地址（播放器直连 CDN） */
-  function ggPlLoad(m3u8) {
-    var ck = String(m3u8);
-    var c = GG_PL[ck];
-    if (c && (Date.now() - c.at) < 10 * 60 * 1000) return Promise.resolve(c.text);
-    return new Promise(function (resolve, reject) {
-      var p;
-      try { p = new URL(m3u8); } catch (e) { return reject(e); }
-      var r = require("https").request({
-        protocol: p.protocol, hostname: p.hostname, port: p.port || 443,
-        path: p.pathname + p.search, method: "GET",
-        headers: { "User-Agent": GG_UA, "Accept-Encoding": "identity" },
-        timeout: 12000
-      }, function (res) {
-        var bufs = [];
-        res.on("data", function (c2) { bufs.push(c2); });
-        res.on("end", function () {
-          if (res.statusCode !== 200) return reject(new Error("playlist " + res.statusCode));
-          var txt = Buffer.concat(bufs).toString("utf8");
-          if (txt.indexOf("#EXTM3U") < 0) return reject(new Error("不是 m3u8"));
-          var out = txt.split("\n").map(function (line) {
-            var t = line.trim();
-            if (!t || t.charAt(0) === "#") return line;
-            try { return new URL(t, m3u8).toString(); } catch (e2) { return line; }
-          }).join("\n");
-          GG_PL[ck] = { at: Date.now(), text: out };
-          var ks = Object.keys(GG_PL);
-          if (ks.length > 300) ks.slice(0, 100).forEach(function (x) { delete GG_PL[x]; });
-          resolve(out);
-        });
-        res.on("error", reject);
-      });
-      r.on("error", reject);
-      r.on("timeout", function () { r.destroy(new Error("timeout")); });
-      r.end();
-    });
-  }
-
-  function ggPlUrl(req, m3u8) {
-    GG_SEQ++;
-    var sid = (GG_SEQ * 2654435761 % 4294967296 >>> 0).toString(36) + (Date.now() % 100000).toString(36);
-    GG_SID[sid] = m3u8;
-    var sk = Object.keys(GG_SID);
-    if (sk.length > 300) sk.slice(0, 100).forEach(function (x) { delete GG_SID[x]; });
-    var host = (req && req.headers && (req.headers.host || req.headers.Host)) || "";
-    if (!host) return m3u8;
-    var root = /^https?:\/\//i.test(host) ? host : "http://" + host;
-    return root + "/spider/girigiri/3/proxy/pl/" + sid + ".m3u8";
-  }
-
-  /* 筛选项：来自 getAllTagOption，缓存 30 分钟 */
-  function ggFilters() {
-    var hit = ggMemGet("FILTERS");
-    if (hit) return Promise.resolve(hit);
-    return ggApi("/Vod/getAllTagOption").then(function (info) {
-      function opts(arr, all) {
-        var out = [{ n: all || "全部", v: "" }];
-        (arr || []).forEach(function (x) { if (x) out.push({ n: String(x), v: String(x) }); });
-        return out;
-      }
-      var f = [
-        { key: "class", name: "类型", value: opts((info && info.vod_class) || []) },
-        { key: "state", name: "题材", value: opts((info && info.vod_state) || []) },
-        { key: "ver", name: "版本", value: opts((info && info.vod_version) || []) },
-        { key: "lang", name: "语言", value: opts((info && info.vod_lang) || []) },
-        { key: "order", name: "排序", value: [{ n: "最新", v: "" }, { n: "最热", v: "hits" }, { n: "高分", v: "score" }] }
-      ];
-      return ggMemSet("FILTERS", f, 30 * 60 * 1000);
-    }).catch(function () {
-      return [{ key: "order", name: "排序", value: [{ n: "最新", v: "" }, { n: "最热", v: "hits" }, { n: "高分", v: "score" }] }];
-    });
-  }
-
-  function ggFiltersMap(f) {
-    var out = {};
-    GG_CATS.forEach(function (c) { out[c[0]] = f; });
-    return out;
-  }
-
-  function ggOut(u, ua) {
-    var o = playObj(u, { ua: ua, header: { "User-Agent": GG_UA } });
-    if (o && typeof o === "object") o.playUrl = "";
-    return o;
-  }
-  /* ============================ Aki动漫 ============================ */
+base: "https://api.xifanacg.com",
+host: "https://next.xifanacg.com",
+key: "sb_publishable_OBIVAWACIX6lPXrO98_z24_HcsmalkA",
+h: function () {
+return {
+apikey: this.key,
+authorization: "Bearer " + this.key,
+"x-platform": "web",
+"x-client-info": "supabase-ssr/0.10.3 createBrowserClient",
+"content-profile": "public",
+Referer: this.host + "/",
+Origin: this.host
+};
+}
+};
+var XF_L1 = "稀饭新番主线-1";
+var XF_L2 = "稀饭新番主线-2";
+var XF_L3 = "稀饭备用-1";
+var XF_LINES = [XF_L1, XF_L2, XF_L3];
+var XF_CATS = [
+["1", "连载新番", { typeId: 1, sort: "updated_at" }],
+["2", "完结旧番", { typeId: 2, sort: "updated_at" }],
+["3", "剧场版", { typeId: 3, sort: "updated_at" }],
+["4", "美漫", { typeId: 4, sort: "updated_at" }],
+["hot", "热门播放", { sort: "view_count" }],
+["score", "高分好评", { sort: "bangumi_score" }],
+["new", "最近上新", { sort: "created_at" }],
+["tv", "TV动画", { fmt: "tv", sort: "updated_at" }],
+["movie", "剧场动画", { fmt: "movie", sort: "updated_at" }],
+["ova", "OVA", { fmt: "ova", sort: "updated_at" }],
+["web", "WEB动画", { fmt: "web", sort: "updated_at" }],
+["fin", "已完结", { fin: true, sort: "updated_at" }],
+["ing", "连载中", { fin: false, sort: "updated_at" }],
+["y2026", "2026年", { year: 2026, sort: "updated_at" }],
+["y2025", "2025年", { year: 2025, sort: "updated_at" }],
+["y2024", "2024年", { year: 2024, sort: "updated_at" }],
+["y2023", "2023年", { year: 2023, sort: "updated_at" }]
+];
+function xfCat(tid) {
+var s = String(tid == null ? "" : tid).trim();
+for (var i = 0; i < XF_CATS.length; i++) if (XF_CATS[i][0] === s) return XF_CATS[i];
+return [s || "1", s || "连载新番", { typeId: 1, sort: "updated_at" }];
+}
+var XF_AGENT = new (require("https").Agent)({ keepAlive: true, maxSockets: 24, maxFreeSockets: 12, keepAliveMsecs: 15000 });
+function xfApi(u, opt) {
+opt = opt || {};
+return new Promise(function (resolve, reject) {
+var p;
+try { p = new URL(u); } catch (e) { return reject(e); }
+var lib = require("https");
+var body = opt.body ? Buffer.from(JSON.stringify(opt.body)) : null;
+var headers = Object.assign({}, XF.h(), { "Accept-Encoding": "gzip, deflate" }, opt.headers || {});
+if (body) { headers["Content-Type"] = "application/json"; headers["Content-Length"] = String(body.length); }
+var r = lib.request({
+protocol: p.protocol, hostname: p.hostname, port: p.port || 443,
+path: p.pathname + p.search, method: body ? "POST" : "GET",
+headers: headers, agent: XF_AGENT, timeout: opt.timeout || 12000
+}, function (res) {
+var code = res.statusCode || 0;
+if (code >= 301 && code <= 308 && res.headers.location) {
+try { res.resume(); } catch (e0) { }
+var nx;
+try { nx = new URL(res.headers.location, u).toString(); } catch (e1) { return reject(e1); }
+return resolve(xfApi(nx, opt));
+}
+var stream = res, enc = String(res.headers["content-encoding"] || "").toLowerCase();
+try {
+if (enc.indexOf("gzip") >= 0) stream = res.pipe(require("zlib").createGunzip());
+else if (enc.indexOf("deflate") >= 0) stream = res.pipe(require("zlib").createInflate());
+} catch (e2) { stream = res; }
+var chunks = [];
+stream.on("data", function (c) { chunks.push(c); });
+stream.on("end", function () { resolve({ status: code, headers: res.headers, body: Buffer.concat(chunks).toString("utf8") }); });
+stream.on("error", reject);
+});
+r.on("error", reject);
+r.on("timeout", function () { r.destroy(new Error("timeout")); });
+if (body) r.write(body);
+r.end();
+});
+}
+function xfQs(o) {
+var p = [];
+Object.keys(o).forEach(function (k) {
+var v = o[k];
+if (v === undefined || v === null || v === "") return;
+p.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v)));
+});
+return p.join("&");
+}
+var XF_MEM = {};
+function xfMemGet(k) {
+var c = XF_MEM[k];
+if (!c) return null;
+if (c.exp && c.exp < Date.now()) { delete XF_MEM[k]; return null; }
+return c.v;
+}
+function xfMemSet(k, v, ttl) {
+XF_MEM[k] = { v: v, exp: Date.now() + (ttl || 60000) };
+var ks = Object.keys(XF_MEM);
+if (ks.length > 500) ks.slice(0, 150).forEach(function (x) { delete XF_MEM[x]; });
+return v;
+}
+function xfVod(it) {
+if (!it) return null;
+var id = it.id;
+if (id === undefined || id === null || String(id) === "") return null;
+var name = it.title || it.title_original || "";
+var pic = String(it.cover_url || "");
+var cur = Number(it.current_episodes || 0), tot = Number(it.total_episodes || 0);
+var rem = "";
+if (it.is_finished) rem = tot > 0 ? ("全" + tot + "集") : "已完结";
+else if (cur > 0) rem = "更新至" + cur + "集" + (tot > cur ? "/" + tot : "");
+var content = String(it.description || "").trim();
+var tags = it.meta_tags;
+if (tags && tags.length) content += "\n标签：" + tags.slice(0, 8).join(" / ");
+var actors = it.actors;
+return {
+vod_id: String(id),
+vod_name: String(name),
+vod_pic: pic,
+vod_remarks: rem,
+vod_year: String(it.release_year || ""),
+vod_area: String(it.region || ""),
+vod_lang: "日语",
+vod_score: String(it.bangumi_score || ""),
+vod_director: String(it.director || ""),
+vod_actor: Array.isArray(actors) ? actors.slice(0, 6).join(" / ") : "",
+type_name: String(it.format_label || it.format || ""),
+vod_content: content
+};
+}
+var XF_SEL_LIST = "id,title,title_original,cover_url,current_episodes,total_episodes,is_finished,bangumi_score,release_year,region,format,updated_at";
+var XF_SEL_DETAIL = "id,title,title_original,cover_url,description,release_year,region,director,actors,current_episodes,total_episodes,is_finished,bangumi_score,meta_tags,format,episodes(id,episode_number,title,kind)";
+async function xfList(tid, page, wd) {
+page = Number(page) > 0 ? Math.floor(Number(page)) : 1;
+var key = "L:" + tid + ":" + page + ":" + (wd || "");
+var hit = xfMemGet(key);
+if (hit) return hit;
+var c = xfCat(tid)[2];
+var limit = 24;
+var q = { select: XF_SEL_LIST, limit: String(limit), offset: String((page - 1) * limit) };
+if (wd) {
+var w = String(wd).trim().replace(/[(),*]/g, " ");
+q.or = "(title.ilike.*" + w + "*,search_title.ilike.*" + w + "*)";
+} else {
+q.is_published = "eq.true";
+if (c.typeId) q.type_id = "eq." + c.typeId;
+if (c.fmt) q.format = "eq." + c.fmt;
+if (c.fin !== undefined) q.is_finished = "eq." + c.fin;
+if (c.year) q.release_year = "eq." + c.year;
+}
+q.order = (c.sort || "updated_at") + ".desc";
+var r = await xfApi(XF.base + "/rest/v1/animes?" + xfQs(q), { headers: { Prefer: "count=exact" }, timeout: 15000 });
+var arr = js(r.body);
+var list = [];
+if (Array.isArray(arr)) {
+for (var i = 0; i < arr.length; i++) { var v = xfVod(arr[i]); if (v) list.push(v); }
+}
+var total = list.length;
+var cr = String((r.headers && r.headers["content-range"]) || "");
+var m = /\/(\d+)\s*$/.exec(cr);
+if (m) total = Number(m[1]) || total;
+var out = { list: list, total: total, page: page, pagecount: Math.max(1, Math.ceil(total / limit)), limit: limit };
+return xfMemSet(key, out, 90 * 1000);
+}
+async function xfHome() {
+var hit = xfMemGet("HOME");
+if (hit) return hit;
+var jobs = [
+xfList("1", 1, "").catch(function () { return { list: [] }; }),
+xfList("new", 1, "").catch(function () { return { list: [] }; }),
+xfList("score", 1, "").catch(function () { return { list: [] }; })
+];
+var rs = await Promise.all(jobs);
+var seen = {}, list = [];
+rs.forEach(function (r) {
+(r.list || []).forEach(function (v) {
+if (!v || seen[v.vod_id]) return;
+seen[v.vod_id] = 1;
+list.push(v);
+});
+});
+var out = {
+"class": XF_CATS.map(function (c2) { return { type_id: c2[0], type_name: c2[1] }; }),
+filters: {},
+list: list.slice(0, 24)
+};
+return xfMemSet("HOME", out, 90 * 1000);
+}
+async function xfDetail(id) {
+id = String(id || "").trim();
+if (!id) return null;
+var key = "D:" + id;
+var hit = xfMemGet(key);
+if (hit) return hit;
+var r = await xfApi(XF.base + "/rest/v1/animes?" + xfQs({ id: "eq." + id, select: XF_SEL_DETAIL, limit: "1" }), { timeout: 15000 });
+var arr = js(r.body);
+var a = (Array.isArray(arr) && arr[0]) ? arr[0] : null;
+if (!a) return null;
+var eps = Array.isArray(a.episodes) ? a.episodes : [];
+if (!eps.length) {
+var r2 = await xfApi(XF.base + "/rest/v1/episodes?" + xfQs({ anime_id: "eq." + id, select: "id,episode_number,title,kind", order: "episode_number.asc", limit: "3000" }), { timeout: 15000 });
+var e2 = js(r2.body);
+if (Array.isArray(e2)) eps = e2;
+}
+eps = eps.filter(function (x) { return x && x.id !== undefined && x.id !== null; });
+eps.sort(function (x, y) { return (Number(x.episode_number) || 0) - (Number(y.episode_number) || 0); });
+var parts = [];
+for (var i = 0; i < eps.length; i++) {
+var n = (eps[i].episode_number === undefined || eps[i].episode_number === null) ? (i + 1) : Math.floor(Number(eps[i].episode_number));
+var t = String(eps[i].title || "").trim();
+parts.push("第" + (n < 10 ? "0" + n : n) + "集" + (t ? " " + t : "") + "$" + eps[i].id);
+}
+var v = xfVod(a) || { vod_id: id, vod_name: id };
+var epsStr = parts.join("#");
+v.vod_play_from = XF_LINES.join("$$$");
+v.vod_play_url = [epsStr, epsStr, epsStr].join("$$$");
+if (parts.length) v.vod_remarks = (v.vod_remarks ? v.vod_remarks + " · " : "") + "3线";
+var out = { list: [v] };
+if (eps.length) {
+var ep0 = String(eps[0].id);
+setTimeout(function () {
+try { xfTicket(ep0).catch(function () { }); } catch (e0) { }
+}, 0);
+}
+return xfMemSet(key, out, 5 * 60 * 1000);
+}
+var XF_TICKET = {};
+function xfTicket(ep, force) {
+var k = String(ep), now = Date.now(), c = XF_TICKET[k];
+if (!force && c && (now - c.at) < 6 * 60 * 1000 && (!c.exp || c.exp * 1000 > now + 120000)) return Promise.resolve(c);
+return xfApi(XF.base + "/functions/v1/issue-web-playback", { body: { action: "fallback", episode_id: Number(ep) }, timeout: 15000 }).then(function (r) {
+var j = js(r.body) || {};
+var main = j.url ? String(j.url) : "";
+var mp4 = [], hls = "", sizes = {};
+(j.candidates || []).forEach(function (x) {
+var u = (x && x.url) ? String(x.url) : "";
+if (!u) return;
+sizes[u] = Number(x.expected_bytes || 0) || 0;
+if (/\.m3u8(\?|#|$)/i.test(u)) { if (!hls) hls = u; return; }
+if (mp4.indexOf(u) < 0) mp4.push(u);
+});
+if (main) {
+if (/\.m3u8(\?|#|$)/i.test(main)) { if (!hls) hls = main; }
+else if (mp4.indexOf(main) < 0) mp4.unshift(main);
+}
+var rec = { mp4: mp4, hls: hls, sizes: sizes, finals: {}, exp: Number(j.expires_at || 0) || 0, at: now };
+if (mp4.length || hls) XF_TICKET[k] = rec;
+var ks = Object.keys(XF_TICKET);
+if (ks.length > 300) ks.slice(0, 100).forEach(function (x) { delete XF_TICKET[x]; });
+return rec;
+}).catch(function () { return null; });
+}
+var XF_HLSV = {};
+function xfCollect(res, cap, timeoutMs) {
+return new Promise(function (resolve) {
+var buf = [], n = 0, done = false;
+function fin() {
+if (done) return; done = true;
+var b = Buffer.concat(buf);
+resolve({ n: n, buf: b, text: b.toString("utf8") });
+}
+res.on("data", function (c) {
+if (done) return;
+n += c.length; buf.push(c);
+if (cap && n >= cap) { fin(); try { res.destroy(); } catch (e0) { } }
+});
+res.on("end", fin);
+res.on("error", fin);
+if (timeoutMs) setTimeout(fin, timeoutMs);
+});
+}
+async function xfHlsOk(rec, ep) {
+var k = String(ep), c = XF_HLSV[k];
+if (c && (Date.now() - c.at) < 10 * 60 * 1000) return c.ok;
+var ok = false;
+if (!rec || !rec.hls) {
+XF_HLSV[k] = { ok: false, at: Date.now() };
+return false;
+}
+try {
+var r1 = await xfHttpGet(rec.hls, { "User-Agent": XF_CDN_UA }, 1200);
+if (r1.statusCode === 200) {
+var t1 = await xfCollect(r1, 96 * 1024, 900);
+var segs = String(t1.text || "").split("\n").map(function (s) { return s.trim(); })
+.filter(function (l) { return l && l.charAt(0) !== "#"; });
+if (segs.length) {
+var seg = segs[0];
+try { seg = new URL(seg, rec.hls).toString(); } catch (e1) { }
+var t0 = Date.now();
+var r2 = await xfHttpGet(seg, { "User-Agent": XF_CDN_UA, Range: "bytes=0-131071", "Accept-Encoding": "identity" }, 1000);
+if (r2.statusCode === 200 || r2.statusCode === 206) {
+var got = await xfCollect(r2, 131072, 1000);
+var secs = Math.max(0.25, (Date.now() - t0) / 1000);
+var kbs = got.n / 1024 / secs;
+ok = got.n >= 65536 && kbs >= 500;
+}
+}
+}
+} catch (e2) { ok = false; }
+XF_HLSV[k] = { ok: ok, at: Date.now() };
+return ok;
+}
+function xfOut(u, ua) {
+var o = playObj(u, { ua: ua, header: { "User-Agent": XF_CDN_UA } });
+if (o && typeof o === "object") o.playUrl = "";
+return o;
+}
+var XF_CDN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+var XF_RL_W = 16, XF_RL_CHUNK = 1 << 20, XF_RL_HEAD = 1 << 20, XF_RL_HW = 8, XF_RL_PREFILL = 0, XF_RL_CACHE = 32 << 20;
+var XF_ITEMS = {}, XF_SEQ = 0;
+function xfHttpGet(u, headers, timeout, depth) {
+depth = depth || 0;
+return new Promise(function (resolve, reject) {
+var p;
+try { p = new URL(u); } catch (e) { return reject(e); }
+var lib = p.protocol === "http:" ? require("http") : require("https");
+var r = lib.request({
+protocol: p.protocol, hostname: p.hostname, port: p.port || (p.protocol === "http:" ? 80 : 443),
+path: p.pathname + p.search, method: "GET", headers: headers || {}, timeout: timeout || 30000
+}, function (res) {
+var code = res.statusCode || 0;
+if (code === 301 || code === 302 || code === 303 || code === 307 || code === 308) {
+var loc = res.headers && res.headers.location;
+try { res.resume(); } catch (e0) { }
+if (loc && depth < 5) {
+var next;
+try { next = new URL(loc, u).toString(); } catch (e1) { return reject(e1); }
+return resolve(xfHttpGet(next, headers, timeout, depth + 1));
+}
+return reject(new Error("redirect " + code));
+}
+res.__url = u;
+resolve(res);
+});
+r.on("error", reject);
+r.on("timeout", function () { r.destroy(new Error("timeout")); });
+r.end();
+});
+}
+function xfRange(it, s, e, tries) {
+tries = tries || 3;
+var want = e - s + 1;
+function attempt(n) {
+if (n > tries) {
+var alts = (it.alts || []).filter(function (u) { return u && u !== it.url; });
+if (!it._altSwitched && alts.length) {
+it._altSwitched = true;
+it.url = alts[0]; it.alts = alts.slice(1); it.final = "";
+return attempt(1);
+}
+return Promise.resolve(Buffer.alloc(0));
+}
+return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=" + s + "-" + e, "Accept-Encoding": "identity" }))
+.then(function (res) {
+var code = res.statusCode || 0;
+if (code === 200 && s > 0) {
+try { res.destroy(); } catch (x0) { }
+it.final = "";
+if (it.refresh && n === 1) {
+return Promise.resolve(it.refresh()).then(function (nx) {
+if (nx && nx.url) { it.url = nx.url; it.headers = nx.headers || it.headers; }
+return attempt(n + 1);
+}).catch(function () { return attempt(n + 1); });
+}
+return attempt(n + 1);
+}
+if (code !== 200 && code !== 206) {
+try { res.resume(); } catch (x1) { }
+if (it.refresh && n === 1) {
+return Promise.resolve(it.refresh()).then(function (nx) {
+if (nx && nx.url) { it.url = nx.url; it.headers = nx.headers || it.headers; it.final = ""; }
+return attempt(n + 1);
+}).catch(function () { return attempt(n + 1); });
+}
+return attempt(n + 1);
+}
+if (code === 206) {
+var cr = String(res.headers["content-range"] || "");
+var mm = /bytes\s+(\d+)-/.exec(cr);
+if (mm && Number(mm[1]) !== s) {
+try { res.destroy(); } catch (x2) { }
+it.final = "";
+return attempt(n + 1);
+}
+}
+if (res.__url && res.__url !== it.url) {
+it.url = res.__url;
+if (it.onFinal) { try { it.onFinal(res.__url); } catch (e_f) { } }
+}
+return new Promise(function (resolve) {
+var buf = [], got = 0, done = false;
+function fin(b) { if (!done) { done = true; resolve(b); } }
+res.on("data", function (c) {
+if (done) return;
+buf.push(c); got += c.length;
+if (got >= want) { fin(Buffer.concat(buf).slice(0, want)); try { res.resume(); } catch (x3) { } }
+});
+res.on("end", function () { fin(got >= want ? Buffer.concat(buf).slice(0, want) : Buffer.alloc(0)); });
+res.on("error", function () { fin(Buffer.alloc(0)); });
+}).then(function (b) {
+if (b.length === want) return b;
+return attempt(n + 1);
+});
+}).catch(function () { return attempt(n + 1); });
+}
+return attempt(1);
+}
+function xfSize(it) {
+if (it.size) return Promise.resolve(it.size);
+return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=0-0", "Accept-Encoding": "identity" }), 12000).then(function (res) {
+var m = /\/(\d+)\s*$/.exec(String(res.headers["content-range"] || ""));
+if (res.__url && res.__url !== it.url) it.url = res.__url;
+try { res.resume(); } catch (x) { }
+if (m) it.size = Number(m[1]);
+return it.size || 0;
+}).catch(function () { return 0; });
+}
+function xfResolve(it) {
+if (it.final) return Promise.resolve(it.final);
+if (it.resolving) return it.resolving;
+it.resolving = xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=0-1", "Accept-Encoding": "identity" }), 10000).then(function (res) {
+var m = /\/(\d+)\s*$/.exec(String(res.headers["content-range"] || ""));
+if (m) it.size = Number(m[1]) || it.size;
+if (res.__url) {
+it.final = res.__url; it.url = res.__url;
+if (it.onFinal) { try { it.onFinal(res.__url); } catch (e0) { } }
+}
+try { res.destroy(); } catch (e1) { }
+it.resolving = null;
+return it.final || it.url;
+}).catch(function () { it.resolving = null; return it.url; });
+return it.resolving;
+}
+function xfPipeDirect(it, res, start, end) {
+return xfHttpGet(it.url, Object.assign({}, it.headers, { Range: "bytes=" + start + "-" + end, "Accept-Encoding": "identity" }), 30000).then(function (r) {
+var skip = (r.statusCode === 200 && start > 0) ? start : 0;
+var pos = start;
+r.on("data", function (c) {
+var buf = c;
+if (skip > 0) {
+if (c.length <= skip) { skip -= c.length; return; }
+buf = c.slice(skip); skip = 0;
+}
+if (pos + buf.length > end + 1) buf = buf.slice(0, end + 1 - pos);
+if (!buf.length) return;
+pos += buf.length;
+try { res.write(buf); } catch (e0) { }
+if (pos > end) { try { r.destroy(); } catch (e1) { } try { res.end(); } catch (e2) { } }
+});
+r.on("end", function () { try { res.end(); } catch (e) { } });
+r.on("error", function () { try { res.end(); } catch (e) { } });
+}).catch(function () { try { res.end(); } catch (e) { } });
+}
+function xfWarmHead(it) {
+if (it.headWarm) return;
+var hs = Math.ceil(XF_RL_HEAD / XF_RL_HW);
+it.headWarmHS = hs;
+it.headWarm = [];
+for (var i = 0; i < XF_RL_HW; i++) {
+(function (idx, s0) {
+var hit = it.cache && it.cache[s0];
+if (hit && hit.length === hs) { it.headWarm[idx] = Promise.resolve(hit); return; }
+it.headWarm[idx] = xfRange(it, s0, s0 + hs - 1, 1).then(function (b) {
+if (b && b.length === hs) xfCachePut(it, s0, b);
+return b;
+}).catch(function () { return null; });
+})(i, i * hs);
+}
+}
+function xfCachePut(it, p, buf) {
+if (!it.cache) { it.cache = {}; it.cacheBytes = 0; }
+if (!buf || !buf.length || it.cache[p]) return;
+it.cache[p] = buf; it.cacheBytes += buf.length;
+while (it.cacheBytes > XF_RL_CACHE) {
+var ks = Object.keys(it.cache);
+if (!ks.length) break;
+it.cacheBytes -= it.cache[ks[0]].length;
+delete it.cache[ks[0]];
+}
+}
+function xfStream(req, res, it) {
+var closed = false;
+res.on("close", function () { closed = true; });
+try { xfResolve(it); } catch (e_r) { }
+xfSize(it).then(function (total) {
+if (!total || total <= 0) { res.statusCode = 502; return res.end(); }
+var hdr = (req.headers && req.headers.range) || "";
+var start = 0, end = total - 1, m = /bytes=(\d*)-(\d*)/.exec(hdr);
+if (m) {
+if (m[1] === "" && m[2]) start = Math.max(0, total - Number(m[2]));
+else { start = Number(m[1] || 0); end = m[2] ? Number(m[2]) : total - 1; }
+}
+if (start >= total) { res.statusCode = 416; res.setHeader("Content-Range", "bytes */" + total); return res.end(); }
+if (end >= total) end = total - 1;
+res.statusCode = hdr ? 206 : 200;
+res.setHeader("Content-Type", "video/mp4");
+res.setHeader("Accept-Ranges", "bytes");
+res.setHeader("Content-Length", String(end - start + 1));
+if (hdr) res.setHeader("Content-Range", "bytes " + start + "-" + end + "/" + total);
+res.setHeader("Cache-Control", "no-store");
+res.setHeader("Connection", "close");
+if (req.method === "HEAD") return res.end();
+var pending = {}, order = [], nextPos = start, outPos = start, retryN = {};
+function submit(p) {
+var sz = Math.min(XF_RL_CHUNK, end - p + 1), b = p + sz - 1;
+var hit = it.cache && it.cache[p];
+if (hit && hit.length === b - p + 1) { pending[p] = Promise.resolve(hit); return b + 1; }
+pending[p] = xfRange(it, p, b, 3).then(function (x) { xfCachePut(it, p, x); return x; });
+return b + 1;
+}
+function pump() {
+if (closed) return;
+var p = order.shift();
+if (p === undefined) return;
+var pr = pending[p];
+if (!pr) return res.end();
+pr.then(function (buf) {
+delete pending[p];
+if (closed) return;
+if (!buf || !buf.length) {
+var n = (retryN[p] || 0) + 1;
+if (n <= 3) {
+retryN[p] = n; order.unshift(p);
+var sz2 = Math.min(XF_RL_CHUNK, end - p + 1);
+pending[p] = xfRange(it, p, p + sz2 - 1, 3).then(function (x) { xfCachePut(it, p, x); return x; });
+return setTimeout(pump, 150 * n);
+}
+return res.end();
+}
+res.write(buf, function () {
+if (closed) return;
+outPos += buf.length;
+if (nextPos <= end) { order.push(nextPos); nextPos = submit(nextPos); }
+if (outPos > end) return res.end();
+pump();
+});
+}).catch(function () { try { res.end(); } catch (x) { } });
+}
+var headWant = Math.min(XF_RL_HEAD, end - start + 1);
+var winStart = Math.min(start + headWant, end + 1);
+var preQueued = [], prefilled = false, winStarted = false, headTried = false;
+function prefill() {
+if (prefilled) return;
+prefilled = true;
+var p2 = winStart, k = 0;
+while (p2 <= end && k < XF_RL_PREFILL) { preQueued.push(p2); p2 = submit(p2); k++; }
+nextPos = p2;
+}
+function startWindow() {
+if (winStarted) return;
+winStarted = true;
+if (outPos !== winStart) {
+pending = {}; preQueued = []; prefilled = true; nextPos = outPos;
+while (nextPos <= end && order.length < XF_RL_W) { order.push(nextPos); nextPos = submit(nextPos); }
+return pump();
+}
+if (!prefilled) prefill();
+for (var qi = 0; qi < preQueued.length; qi++) order.push(preQueued[qi]);
+preQueued = [];
+while (nextPos <= end && order.length < XF_RL_W) { order.push(nextPos); nextPos = submit(nextPos); }
+pump();
+}
+function headStream() {
+var hs = Math.ceil(headWant / XF_RL_HW);
+var sliceN = Math.min(XF_RL_HW, Math.ceil(headWant / hs));
+var slices = new Array(sliceN), wi0 = 0, done0 = 0;
+function flush() {
+while (wi0 < sliceN && slices[wi0] && slices[wi0].length) {
+var b = slices[wi0]; slices[wi0] = null; wi0++;
+outPos += b.length;
+if (!closed) { try { res.write(b); } catch (e0) { } }
+}
+}
+for (var hi = 0; hi < sliceN; hi++) {
+(function (idx) {
+var s0 = start + idx * hs, e0 = Math.min(s0 + hs - 1, start + headWant - 1);
+var want2 = e0 - s0 + 1;
+var cand = it.cache && it.cache[s0];
+var run;
+if (cand && cand.length === want2) run = Promise.resolve(cand);
+else if (start === 0 && it.headWarm && it.headWarmHS === hs && headWant === XF_RL_HEAD && it.headWarm[idx]) {
+run = it.headWarm[idx].then(function (b) {
+return (b && b.length === want2) ? b : xfRange(it, s0, e0, 2);
+});
+} else run = xfRange(it, s0, e0, 2);
+run.then(function (b) {
+slices[idx] = b || Buffer.alloc(0);
+}).catch(function () {
+slices[idx] = Buffer.alloc(0);
+}).then(function () {
+flush();
+done0++;
+if (closed) return;
+if (done0 >= sliceN) startWindow();
+});
+})(hi);
+}
+}
+function headAlt() {
+if (closed) return;
+var alts = (it.alts || []).filter(function (u) { return u && u !== it.url; });
+if (!headTried && alts.length) {
+headTried = true;
+it.url = alts[0]; it.final = ""; it.alts = alts.slice(1);
+pending = {}; order = []; preQueued = []; prefilled = false;
+return headStream();
+}
+xfPipeDirect(it, res, start, end);
+}
+prefill();
+headStream();
+}).catch(function () { try { res.statusCode = 502; res.end(); } catch (x) { } });
+}
+function xfRelayUrl(req, it) {
+XF_SEQ++;
+var sid = ((Date.now() % 100000) * 1000 + (XF_SEQ % 1000)).toString(36);
+XF_ITEMS[sid] = it;
+var ks = Object.keys(XF_ITEMS);
+if (ks.length > 24) ks.slice(0, ks.length - 24).forEach(function (k) { delete XF_ITEMS[k]; });
+var host = (req && req.headers && (req.headers.host || req.headers.Host)) || "";
+if (!host) return "";
+var root = /^https?:\/\//i.test(host) ? host : "http://" + host;
+return root + "/spider/xifan/3/proxy/raw/" + sid;
+}var GG = {
+api: "https://m3u8.girigirilove.com/api.php",
+host: "https://ani.girigirilove.com",
+img: "https://jpg.girigirilove.com"
+};
+var GG_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+var GG_AGENT = new (require("https").Agent)({ keepAlive: true, maxSockets: 20, maxFreeSockets: 10, keepAliveMsecs: 15000 });
+var GG_MEM = {}, GG_PL = {}, GG_SID = {}, GG_SEQ = 0;
+var GG_LINE = "🌸 GiriGiri";
+var GG_CATS = [
+["2", "日漫·连载", { typeId: "2" }],
+["21", "劇場版", { typeId: "21" }],
+["3", "欧美动漫", { typeId: "3" }],
+["20", "真人番剧", { typeId: "20" }],
+["hot", "热门播放", { orderby: "hits" }],
+["score", "高分好评", { orderby: "score" }]
+];
+function ggCat(tid) {
+var s = String(tid == null ? "" : tid).trim();
+for (var i = 0; i < GG_CATS.length; i++) if (GG_CATS[i][0] === s) return GG_CATS[i];
+return GG_CATS[0];
+}
+function ggQs(o) {
+var p = [];
+Object.keys(o).forEach(function (k) {
+var v = o[k];
+if (v === undefined || v === null || v === "") return;
+p.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v)));
+});
+return p.join("&");
+}
+function ggMemGet(k) {
+var c = GG_MEM[k];
+if (!c) return null;
+if (c.exp && c.exp < Date.now()) { delete GG_MEM[k]; return null; }
+return c.v;
+}
+function ggMemSet(k, v, ttl) {
+GG_MEM[k] = { v: v, exp: Date.now() + (ttl || 60000) };
+var ks = Object.keys(GG_MEM);
+if (ks.length > 400) ks.slice(0, 120).forEach(function (x) { delete GG_MEM[x]; });
+return v;
+}
+function ggApi(path, q) {
+var url = GG.api + path + (q && Object.keys(q).length ? ("?" + ggQs(q)) : "");
+return new Promise(function (resolve, reject) {
+var p;
+try { p = new URL(url); } catch (e) { return reject(e); }
+var r = require("https").request({
+protocol: p.protocol, hostname: p.hostname, port: p.port || 443,
+path: p.pathname + p.search, method: "GET",
+headers: {
+"User-Agent": GG_UA, Accept: "application/json", Referer: GG.host + "/",
+"Accept-Encoding": "gzip, deflate"
+},
+agent: GG_AGENT, timeout: 12000
+}, function (res) {
+var stream = res, enc = String(res.headers["content-encoding"] || "").toLowerCase();
+try {
+if (enc.indexOf("gzip") >= 0) stream = res.pipe(require("zlib").createGunzip());
+else if (enc.indexOf("deflate") >= 0) stream = res.pipe(require("zlib").createInflate());
+} catch (e0) { stream = res; }
+var chunks = [];
+stream.on("data", function (c) { chunks.push(c); });
+stream.on("end", function () {
+var txt = Buffer.concat(chunks).toString("utf8");
+var j = null;
+try { j = JSON.parse(txt); } catch (e1) { j = null; }
+if (!j) return reject(new Error("接口返回非 JSON"));
+if (Number(j.code) !== 1 && j.code !== undefined) return reject(new Error(j.msg || ("code " + j.code)));
+resolve(j.info === undefined ? j : j.info);
+});
+stream.on("error", reject);
+});
+r.on("error", reject);
+r.on("timeout", function () { r.destroy(new Error("timeout")); });
+r.end();
+});
+}
+function ggPic(p) {
+var s = String(p == null ? "" : p).trim();
+if (!s) return "";
+if (s.indexOf("//") === 0) return "https:" + s;
+if (/^https?:/i.test(s)) return s;
+return GG.img + (s.charAt(0) === "/" ? s : "/" + s);
+}
+function ggVod(it) {
+if (!it) return null;
+var id = it.vod_id;
+if (id === undefined || id === null || String(id) === "") return null;
+return {
+vod_id: String(id),
+vod_name: String(it.vod_name || "").trim(),
+vod_pic: ggPic(it.vod_pic),
+vod_remarks: String(it.vod_remarks || "").replace(/\s*\/\s*0點0分\s*$/, "").trim(),
+vod_year: String(it.vod_year || ""),
+vod_area: String(it.vod_area || ""),
+vod_score: String(it.vod_score || ""),
+vod_actor: String(it.vod_actor || "").slice(0, 120),
+vod_director: String(it.vod_director || ""),
+vod_content: String(it.vod_blurb || it.vod_content || "").trim()
+};
+}
+async function ggList(tid, page, wd, flt) {
+page = Number(page) > 0 ? Math.floor(Number(page)) : 1;
+flt = flt || {};
+var ck = "G:" + tid + ":" + page + ":" + (wd || "") + ":" + JSON.stringify(flt);
+var hit = ggMemGet(ck);
+if (hit) return hit;
+var c = ggCat(tid)[2] || {};
+var limit = 24;
+var q = { offset: String((page - 1) * limit), limit: String(limit) };
+if (c.typeId) q.type_id = c.typeId;
+if (c.orderby) q.orderby = c.orderby;
+if (wd) q.vod_name = String(wd).trim();
+if (flt["class"]) q.vod_class = flt["class"];
+if (flt.lang) q.vod_lang = flt.lang;
+if (flt.ver) q.vod_version = flt.ver;
+if (flt.state) q.vod_state = flt.state;
+if (flt.order) q.orderby = flt.order;
+var info = await ggApi("/Vod/get_list", q);
+var rows = (info && info.rows) || [];
+var list = [];
+for (var i = 0; i < rows.length; i++) { var v = ggVod(rows[i]); if (v) list.push(v); }
+var total = Number(info && info.total) || list.length;
+var out = { list: list, total: total, page: page, limit: limit, pagecount: Math.max(1, Math.ceil(total / limit)) };
+return ggMemSet(ck, out, 90 * 1000);
+}
+async function ggDetail(id) {
+id = String(id || "").trim();
+if (!id) return null;
+var ck = "GD:" + id;
+var hit = ggMemGet(ck);
+if (hit) return hit;
+var info = await ggApi("/Vod/get_detail", { vod_id: id });
+if (!info || !info.vod_id) return null;
+var froms = String(info.vod_play_from || "").split("$$$");
+var groups = String(info.vod_play_url || "").split("$$$");
+var v = ggVod(info) || { vod_id: id, vod_name: id };
+v.vod_content = String(info.vod_blurb || info.vod_content || "").trim();
+if (info.vod_pubdate) v.vod_pubdate = String(info.vod_pubdate);
+var lines = [], urls = [], epsFirst = "";
+for (var g = 0; g < groups.length; g++) {
+var items = String(groups[g] || "").split("#").filter(function (x) { return x && x.indexOf("$") > 0; });
+if (!items.length) continue;
+var parts = [];
+for (var i = 0; i < items.length; i++) {
+var k = items[i].lastIndexOf("$");
+var nm = items[i].slice(0, k).trim();
+var u = items[i].slice(k + 1).trim();
+if (!/^https?:\/\//i.test(u)) continue;
+var label = /^\d+$/.test(nm) ? ("第" + (nm.length < 2 ? "0" + nm : nm) + "集") : (nm || ("第" + (i + 1) + "集"));
+parts.push(label + "$" + u);
+}
+if (!parts.length) continue;
+lines.push(GG_LINE + (groups.length > 1 ? ("-" + (g + 1)) : ""));
+urls.push(parts.join("#"));
+if (!epsFirst) epsFirst = parts[0].split("$").slice(1).join("$");
+}
+if (!lines.length) return null;
+v.vod_play_from = lines.join("$$$");
+v.vod_play_url = urls.join("$$$");
+if (v.vod_remarks) v.vod_remarks += " · " + lines.length + "线";
+var warm = [];
+String(urls[0] || "").split("#").slice(0, 3).forEach(function (x) {
+var k = x.lastIndexOf("$");
+if (k > 0 && /^https?:\/\//i.test(x.slice(k + 1))) warm.push(x.slice(k + 1));
+});
+if (warm.length) {
+setTimeout(function () {
+var i = 0;
+(function next() {
+if (i >= warm.length) return;
+var u = warm[i++];
+try { ggPlLoad(u).then(function () { next(); }).catch(function () { next(); }); } catch (e0) { next(); }
+})();
+}, 0);
+}
+return ggMemSet(ck, { list: [v] }, 5 * 60 * 1000);
+}
+function ggPlLoad(m3u8) {
+var ck = String(m3u8);
+var c = GG_PL[ck];
+if (c && (Date.now() - c.at) < 10 * 60 * 1000) return Promise.resolve(c.text);
+return new Promise(function (resolve, reject) {
+var p;
+try { p = new URL(m3u8); } catch (e) { return reject(e); }
+var r = require("https").request({
+protocol: p.protocol, hostname: p.hostname, port: p.port || 443,
+path: p.pathname + p.search, method: "GET",
+headers: { "User-Agent": GG_UA, "Accept-Encoding": "identity" },
+timeout: 12000
+}, function (res) {
+var bufs = [];
+res.on("data", function (c2) { bufs.push(c2); });
+res.on("end", function () {
+if (res.statusCode !== 200) return reject(new Error("playlist " + res.statusCode));
+var txt = Buffer.concat(bufs).toString("utf8");
+if (txt.indexOf("#EXTM3U") < 0) return reject(new Error("不是 m3u8"));
+var out = txt.split("\n").map(function (line) {
+var t = line.trim();
+if (!t || t.charAt(0) === "#") return line;
+try { return new URL(t, m3u8).toString(); } catch (e2) { return line; }
+}).join("\n");
+GG_PL[ck] = { at: Date.now(), text: out };
+var ks = Object.keys(GG_PL);
+if (ks.length > 300) ks.slice(0, 100).forEach(function (x) { delete GG_PL[x]; });
+resolve(out);
+});
+res.on("error", reject);
+});
+r.on("error", reject);
+r.on("timeout", function () { r.destroy(new Error("timeout")); });
+r.end();
+});
+}
+function ggPlUrl(req, m3u8) {
+GG_SEQ++;
+var sid = (GG_SEQ * 2654435761 % 4294967296 >>> 0).toString(36) + (Date.now() % 100000).toString(36);
+GG_SID[sid] = m3u8;
+var sk = Object.keys(GG_SID);
+if (sk.length > 300) sk.slice(0, 100).forEach(function (x) { delete GG_SID[x]; });
+var host = (req && req.headers && (req.headers.host || req.headers.Host)) || "";
+if (!host) return m3u8;
+var root = /^https?:\/\//i.test(host) ? host : "http://" + host;
+return root + "/spider/girigiri/3/proxy/pl/" + sid + ".m3u8";
+}
+function ggFilters() {
+var hit = ggMemGet("FILTERS");
+if (hit) return Promise.resolve(hit);
+return ggApi("/Vod/getAllTagOption").then(function (info) {
+function opts(arr, all) {
+var out = [{ n: all || "全部", v: "" }];
+(arr || []).forEach(function (x) { if (x) out.push({ n: String(x), v: String(x) }); });
+return out;
+}
+var f = [
+{ key: "class", name: "类型", value: opts((info && info.vod_class) || []) },
+{ key: "state", name: "题材", value: opts((info && info.vod_state) || []) },
+{ key: "ver", name: "版本", value: opts((info && info.vod_version) || []) },
+{ key: "lang", name: "语言", value: opts((info && info.vod_lang) || []) },
+{ key: "order", name: "排序", value: [{ n: "最新", v: "" }, { n: "最热", v: "hits" }, { n: "高分", v: "score" }] }
+];
+return ggMemSet("FILTERS", f, 30 * 60 * 1000);
+}).catch(function () {
+return [{ key: "order", name: "排序", value: [{ n: "最新", v: "" }, { n: "最热", v: "hits" }, { n: "高分", v: "score" }] }];
+});
+}
+function ggFiltersMap(f) {
+var out = {};
+GG_CATS.forEach(function (c) { out[c[0]] = f; });
+return out;
+}
+function ggOut(u, ua) {
+var o = playObj(u, { ua: ua, header: { "User-Agent": GG_UA } });
+if (o && typeof o === "object") o.playUrl = "";
+return o;
+}/* ============================ Aki动漫 ============================ */
   var AKI = { hosts: ["https://www.akianime.cc", "https://www.akianime.com"] };
 
   async function akiFetch(path, opt, ref) {
@@ -25893,103 +25777,91 @@ function ytFilters(ext) {
       }
     },
 {
-      meta: { key: "girigiri", name: "🌸 GiriGiri爱", type: 3 },
-      api: async function (e) {
-        /* 注册时预热连接：用户第一次进站不用再等 TLS 握手 */
-        setTimeout(function () {
-          try { ggApi("/Vod/getAllTagOption").catch(function () { }); } catch (e0) { }
-        }, 1200);
-
-        /* 首页：连载 + 剧場版 并行，去重后给 24 条 */
-        e.post("/home", async function () {
-          /* 三路并行：连载 + 劇場版 + 筛选项 */
-          var rs = await Promise.all([
-            ggList("2", 1, "", {}).catch(function () { return { list: [] }; }),
-            ggList("21", 1, "", {}).catch(function () { return { list: [] }; }),
-            ggFilters().catch(function () { return []; })
-          ]);
-          var flt = rs[2] || [];
-          var seen = {}, list = [];
-          rs.forEach(function (r) {
-            (r.list || []).forEach(function (v) {
-              if (!v || seen[v.vod_id]) return;
-              seen[v.vod_id] = 1;
-              list.push(v);
-            });
-          });
-          return {
-            "class": GG_CATS.map(function (c) { return { type_id: c[0], type_name: c[1] }; }),
-            filters: ggFiltersMap(flt || []),
-            list: list.slice(0, 24)
-          };
-        });
-
-        e.post("/category", async function (req) {
-          var b = body(req);
-          var page = Number(b.page || b.pg || 1) || 1;
-          var flt = b.filters || {};
-          try {
-            var r = await ggList(String(b.id || b.type_id || "2"), page, "", flt);
-            return { page: r.page, pagecount: r.pagecount, limit: r.limit, total: r.total, list: r.list };
-          } catch (err) {
-            return { page: page, pagecount: 1, limit: 24, total: 0, list: [] };
-          }
-        });
-
-        e.post("/search", async function (req) {
-          var b = body(req);
-          var wd = String(b.wd || b.key || "").trim();
-          if (!wd) return { page: 1, pagecount: 1, total: 0, list: [] };
-          var page = Number(b.page || b.pg || 1) || 1;
-          try {
-            var r = await ggList("", page, wd, {});
-            return { page: r.page, pagecount: r.pagecount, limit: r.limit, total: r.total, list: r.list };
-          } catch (err) {
-            return { page: page, pagecount: 1, total: 0, list: [] };
-          }
-        });
-
-        /* 详情：API 直接带出每集 m3u8 */
-        e.post("/detail", async function (req) {
-          var b = body(req);
-          var ids = Array.isArray(b.id) ? b.id : [b.id || b.vod_id];
-          var id = String(ids[0] || "").trim();
-          if (id.indexOf("$") > 0) id = id.slice(id.indexOf("$") + 1);
-          if (!id) return { list: [] };
-          try {
-            var d = await ggDetail(id);
-            return d || { list: [] };
-          } catch (err) {
-            return { list: [] };
-          }
-        });
-
-        /* 播放：id 本身就是 m3u8 直链，转成本地播放列表（缓存命中基本 0ms） */
-        var ggPlay = async function (req) {
-          var b = Object.assign({}, (req && req.query) || {}, body(req));
-          var u = pickEp(b, function (s) { return /^https?:\/\//i.test(s); });
-          if (!u) return playObj("", { ua: uaOf(req), error: "GiriGiri：没有解析出播放地址" });
-          try { ggPlLoad(u).catch(function () { }); } catch (e0) { }
-          return ggOut(ggPlUrl(req, u), uaOf(req));
-        };
-        e.post("/play", ggPlay);
-        e.get("/play", ggPlay);
-
-        /* 本地播放列表：命中缓存直接吐，未命中则抓取并改写相对分片为绝对地址 */
-        e.get("/proxy/pl/:sid", function (req, reply) {
-          var sid = String((req.params && req.params.sid) || "").replace(/\.m3u8$/, "");
-          var src = GG_SID[sid];
-          if (!src) return reply.code(404).send({ error: "not found" });
-          reply.header("Content-Type", "application/vnd.apple.mpegurl");
-          reply.header("Cache-Control", "no-store");
-          return ggPlLoad(src).then(function (txt) {
-            return reply.send(txt);
-          }).catch(function (e2) {
-            return reply.code(502).send({ error: String((e2 && e2.message) || "playlist failed") });
-          });
-        });
-      }
-    },
+meta: { key: "girigiri", name: "🌸 GiriGiri爱", type: 3 },
+api: async function (e) {
+setTimeout(function () {
+try { ggApi("/Vod/getAllTagOption").catch(function () { }); } catch (e0) { }
+}, 1200);
+e.post("/home", async function () {
+var rs = await Promise.all([
+ggList("2", 1, "", {}).catch(function () { return { list: [] }; }),
+ggList("21", 1, "", {}).catch(function () { return { list: [] }; }),
+ggFilters().catch(function () { return []; })
+]);
+var flt = rs[2] || [];
+var seen = {}, list = [];
+rs.forEach(function (r) {
+(r.list || []).forEach(function (v) {
+if (!v || seen[v.vod_id]) return;
+seen[v.vod_id] = 1;
+list.push(v);
+});
+});
+return {
+"class": GG_CATS.map(function (c) { return { type_id: c[0], type_name: c[1] }; }),
+filters: ggFiltersMap(flt || []),
+list: list.slice(0, 24)
+};
+});
+e.post("/category", async function (req) {
+var b = body(req);
+var page = Number(b.page || b.pg || 1) || 1;
+var flt = b.filters || {};
+try {
+var r = await ggList(String(b.id || b.type_id || "2"), page, "", flt);
+return { page: r.page, pagecount: r.pagecount, limit: r.limit, total: r.total, list: r.list };
+} catch (err) {
+return { page: page, pagecount: 1, limit: 24, total: 0, list: [] };
+}
+});
+e.post("/search", async function (req) {
+var b = body(req);
+var wd = String(b.wd || b.key || "").trim();
+if (!wd) return { page: 1, pagecount: 1, total: 0, list: [] };
+var page = Number(b.page || b.pg || 1) || 1;
+try {
+var r = await ggList("", page, wd, {});
+return { page: r.page, pagecount: r.pagecount, limit: r.limit, total: r.total, list: r.list };
+} catch (err) {
+return { page: page, pagecount: 1, total: 0, list: [] };
+}
+});
+e.post("/detail", async function (req) {
+var b = body(req);
+var ids = Array.isArray(b.id) ? b.id : [b.id || b.vod_id];
+var id = String(ids[0] || "").trim();
+if (id.indexOf("$") > 0) id = id.slice(id.indexOf("$") + 1);
+if (!id) return { list: [] };
+try {
+var d = await ggDetail(id);
+return d || { list: [] };
+} catch (err) {
+return { list: [] };
+}
+});
+var ggPlay = async function (req) {
+var b = Object.assign({}, (req && req.query) || {}, body(req));
+var u = pickEp(b, function (s) { return /^https?:\/\//i.test(s); });
+if (!u) return playObj("", { ua: uaOf(req), error: "GiriGiri：没有解析出播放地址" });
+try { ggPlLoad(u).catch(function () { }); } catch (e0) { }
+return ggOut(ggPlUrl(req, u), uaOf(req));
+};
+e.post("/play", ggPlay);
+e.get("/play", ggPlay);
+e.get("/proxy/pl/:sid", function (req, reply) {
+var sid = String((req.params && req.params.sid) || "").replace(/\.m3u8$/, "");
+var src = GG_SID[sid];
+if (!src) return reply.code(404).send({ error: "not found" });
+reply.header("Content-Type", "application/vnd.apple.mpegurl");
+reply.header("Cache-Control", "no-store");
+return ggPlLoad(src).then(function (txt) {
+return reply.send(txt);
+}).catch(function (e2) {
+return reply.code(502).send({ error: String((e2 && e2.message) || "playlist failed") });
+});
+});
+}
+},
     akiShell(),
     ytSite(),
     muouSite,
