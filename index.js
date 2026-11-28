@@ -23106,9 +23106,11 @@ var YT = {
   key: "wP5bvxoc3yv7FoBQENFZuAF0EUYr4LTy",
   ua: "okhttp/4.12.0",
   page: 20,
+  /* 解析源不再写死编号：服务商每隔一阵就换 pid（3 → 5/6 → 9），
+     改为 1~12 全轮询 + 上次成功的优先，命中后缓存 12 小时 */
   hosts: [
-    { name: "4kzj", api: "http://4kzj.lyyytv.cn/api/index?appid=10001&videoUrl=", web: 3, four: 5 },
-    { name: "fys", api: "http://fys.lyyytv.cn/api/index?appid=10001&videoUrl=", web: 7, four: 8 }
+    "http://fys.lyyytv.cn/api/index?appid=10001&videoUrl=",
+    "http://4kzj.lyyytv.cn/api/index?appid=10001&videoUrl="
   ],
   filters: [
     ["class", "类型"], ["area", "地区"], ["lang", "语言"], ["year", "年份"],
@@ -23184,22 +23186,44 @@ async function ytAlive(u) {
   try {
     var r = await get(u, { "User-Agent": YT.ua, Range: "bytes=0-0" }, 8000);
     var st = Number((r && r.status) || 0);
-    return st === 200 || st === 206;
+    if (st !== 200 && st !== 206) return false;
+    /* 中转页会回 200 + text/html，光看状态码会误判成"活着" */
+    var ct = String((r.headers && r.headers["content-type"]) || "").toLowerCase();
+    return ct.indexOf("text/html") < 0;
   } catch (e) { return false; }
 }
 
-async function ytParse(raw, kind) {
-  for (var i = 0; i < YT.hosts.length; i++) {
-    var h = YT.hosts[i];
-    var pid = kind === "4k" ? h.four : h.web;
-    var target = h.api + encodeURIComponent(raw) + "&parsesId=" + pid;
-    for (var rnd = 0; rnd < 2; rnd++) {
-      if (rnd) await ytSleep(400 * rnd);
-      try {
-        var res = await get(target, { "User-Agent": YT.ua }, 12000);
-        var out = ytResolve(res && res.body);
-        if (out) return out;
-      } catch (e) { /* 换下一个口 */ }
+var YT_CACHE = {}, YT_LAST = 0;
+/* 同一解析口内 1~12 号并发点射，谁先解出有效地址就用谁 */
+function ytTryAll(base, order) {
+  return new Promise(function (resolve) {
+    var left = order.length, done = false;
+    function fin(pid, url) { if (done) return; done = true; resolve({ pid: pid, url: url }); }
+    order.forEach(function (pid) {
+      get(base + pid, { "User-Agent": YT.ua, "Accept-Encoding": "identity" }, 4500).then(function (r) {
+        var out = (r && r.status === 200) ? ytResolve(r.body) : "";
+        if (out && /^https?:/i.test(out)) return fin(pid, out);
+      }).catch(function () { }).then(function () { if (--left <= 0) fin(0, ""); });
+    });
+  });
+}
+async function ytParse(raw) {
+  var now = Date.now(), c = YT_CACHE[raw];
+  if (c && c.exp > now) return c.url;
+  var order = [];
+  for (var i = 1; i <= 12; i++) order.push(i);
+  if (YT_LAST > 0) {
+    var at = order.indexOf(YT_LAST);
+    if (at >= 0) { order.splice(at, 1); order.unshift(YT_LAST); }
+  }
+  for (var h = 0; h < YT.hosts.length; h++) {
+    var got = await ytTryAll(YT.hosts[h] + encodeURIComponent(raw) + "&parsesId=", order);
+    if (got.url) {
+      YT_LAST = got.pid;
+      YT_CACHE[raw] = { url: got.url, exp: now + 12 * 3600 * 1000 };
+      var ks = Object.keys(YT_CACHE);
+      if (ks.length > 400) ks.slice(0, 100).forEach(function (k) { delete YT_CACHE[k]; });
+      return got.url;
     }
   }
   return "";
@@ -23607,22 +23631,29 @@ function ytFilters(ext) {
 
         var out = "";
         if (YT_FOUR_RE.test(host)) {
-          out = await ytParse(raw, "4k");
+          out = await ytParse(raw);
           /* 换链回来还是 lyyytv 裸链 = 解析口没换成，多半文件已删。
            * 先探一字节，404 就换网页口再试一次，别把死链丢给播放器。 */
           if (out && /\.lyyytv\.cn\//i.test(out) && !(await ytAlive(out))) {
-            var alt = await ytParse(raw, "web");
+            var alt = await ytParse(raw);
             out = (alt && !/\.lyyytv\.cn\//i.test(alt)) ? alt : "";
           }
           if (!out) return playObj("", { ua: ua, error: "影探4K：该线路源文件已失效（4K 直链 404），换一条线路试试" });
         } else if (YT_MEDIA_RE.test(path)) {
           out = raw;
         } else {
-          out = await ytParse(raw, "web");
+          out = await ytParse(raw);
           if (!out && YT_MEDIA_RE.test(path)) out = raw;
+          /* 解析口有时只换出一张中转页（api.69mzf.cn），这种丢给播放器就是 404 黑屏：
+             探 1 字节，死了就给明确提示，让用户去选 4K 云线路 */
+          if (out && !YT_MEDIA_RE.test(out.replace(/[?#].*$/, "")) && !(await ytAlive(out))) {
+            return playObj("", { ua: ua, error: "影探4K：该网页线路的解析源已失效，请换 4K 云线路" });
+          }
           if (!out) return playObj("", { ua: ua, error: "影探4K：页面解析失败（该站点可能需要会员或已下架）" });
         }
-        return playObj(out, { ua: ua, header: { "User-Agent": YT.ua } });
+        var po = playObj(out, { ua: ua, header: { "User-Agent": YT.ua } });
+        if (po && typeof po === "object") po.playUrl = "";
+        return po;
       };
       e.post("/play", onPlay);
       e.get("/play", onPlay);
