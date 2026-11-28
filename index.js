@@ -22297,6 +22297,15 @@ ${X.map(te=>te.name).join(`
     return ok;
   }
 
+  /* 播放响应包装：CatPaw 客户端会把 url 和 playUrl 拼接使用（url + playUrl），
+     playUrl 必须留空 —— 官方站（影探4K / 盘搜）返回的都是 playUrl:""，
+     否则本地代理地址会被拼成 ".../proxy/raw/<sid>http://..." 直接 404。 */
+  function xfOut(u, ua) {
+    var o = playObj(u, { ua: ua, header: { "User-Agent": XF_CDN_UA } });
+    if (o && typeof o === "object") o.playUrl = "";
+    return o;
+  }
+
   /* ======================== 多路 Range 代理 ======================== */
   var XF_CDN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
   /* 实测：该 CDN 单连接 0.3-2MB/s 且波动大；首块 8×128KB 并行能把 moov(994KB) 压到 1-1.5s，
@@ -25684,7 +25693,7 @@ function ytFilters(ext) {
                 new Promise(function (r) { setTimeout(function () { r(false); }, 1200); })
               ]);
             } catch (e1) { okHls = false; }
-            if (okHls) return playObj(rec.hls, { ua: uaOf(req), header: { "User-Agent": XF_CDN_UA } });
+            if (okHls) return xfOut(rec.hls, uaOf(req));
             idx = 0;
           }
 
@@ -25710,7 +25719,7 @@ function ytFilters(ext) {
           try { xfResolve(it); } catch (e2) { }
           try { xfWarmHead(it); } catch (e3) { }
           var relay = xfRelayUrl(req, it);
-          return playObj(relay || url, { ua: uaOf(req), header: { "User-Agent": XF_CDN_UA } });
+          return xfOut(relay || url, uaOf(req));
         };
         e.post("/play", xfPlay);
         e.get("/play", xfPlay);
